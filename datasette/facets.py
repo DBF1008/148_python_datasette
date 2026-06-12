@@ -229,7 +229,7 @@ class ColumnFacet(Facet):
             column = config.get("column") or config["simple"]
             facet_sql = """
                 select {col} as value, count(*) as count from (
-                    {sql}
+                    select {col} from ({sql})
                 )
                 where {col} is not null
                 group by {col} order by count desc, value limit {limit}
@@ -519,10 +519,9 @@ class DateFacet(Facet):
             config = source_and_config["config"]
             source = source_and_config["source"]
             column = config.get("column") or config["simple"]
-            # TODO: does this query break if inner sql produces value or count columns?
             facet_sql = """
                 select date({col}) as value, count(*) as count from (
-                    {sql}
+                    select {col} from ({sql})
                 )
                 where date({col}) is not null
                 group by date({col}) order by count desc, value limit {limit}

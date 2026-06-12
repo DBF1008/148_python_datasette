@@ -734,3 +734,174 @@ async def test_facet_only_considers_first_x_rows():
         assert data2["suggested_facets"] == []
     finally:
         Facet.suggest_consider = original_suggest_consider
+
+
+@pytest.mark.asyncio
+async def test_date_facet_with_value_and_count_columns():
+    # Regression test: inner SQL that already produces columns named
+    # "value" and "count" should not conflict with the facet query's
+    # own "as value" / "as count" aliases.
+    ds = Datasette()
+    db = ds.add_memory_database("test_date_facet_conflict")
+    await db.execute_write(
+        "create table events(id integer primary key, happened text, value text, count integer)"
+    )
+    await db.execute_write_many(
+        "insert into events (happened, value, count) values (?, ?, ?)",
+        [
+            ("2024-01-10", "alpha", 100),
+            ("2024-01-10", "beta", 200),
+            ("2024-01-10", "gamma", 300),
+            ("2024-01-11", "delta", 400),
+            ("2024-01-11", "epsilon", 500),
+            ("2024-01-12", "zeta", 600),
+        ],
+    )
+    facet = DateFacet(
+        ds,
+        Request.fake("/?_facet_date=happened"),
+        database="test_date_facet_conflict",
+        sql="select * from events",
+        table="events",
+    )
+    buckets, timed_out = await facet.facet_results()
+    assert timed_out == []
+    assert len(buckets) == 1
+    bucket = buckets[0]
+    assert bucket["name"] == "happened"
+    assert bucket["type"] == "date"
+    assert bucket["truncated"] is False
+    results = bucket["results"]
+    # Verify counts are the actual group counts, not the inner "count" column values
+    results_by_value = {r["value"]: r for r in results}
+    assert results_by_value["2024-01-10"]["count"] == 3
+    assert results_by_value["2024-01-11"]["count"] == 2
+    assert results_by_value["2024-01-12"]["count"] == 1
+    # Verify values are dates, not the inner "value" column (alpha, beta, etc.)
+    for r in results:
+        assert r["value"].startswith("2024-"), (
+            f"Expected date string, got inner 'value' column data: {r['value']}"
+        )
+    # Verify toggle URLs contain the date filter parameter
+    for r in results:
+        assert f"happened__date={r['value']}" in r["toggle_url"]
+
+
+@pytest.mark.asyncio
+async def test_date_facet_with_value_count_columns_via_custom_sql():
+    # Regression test: when the inner SQL is a custom query (not a plain
+    # table select) that aliases expressions as "value" or "count", the
+    # date facet should still produce correct results.
+    ds = Datasette()
+    db = ds.add_memory_database("test_date_facet_custom_sql")
+    await db.execute_write(
+        "create table logs(id integer primary key, ts text, msg text)"
+    )
+    await db.execute_write_many(
+        "insert into logs (ts, msg) values (?, ?)",
+        [
+            ("2024-03-01 10:00:00", "first"),
+            ("2024-03-01 11:00:00", "second"),
+            ("2024-03-02 09:00:00", "third"),
+            ("2024-03-02 10:00:00", "fourth"),
+            ("2024-03-02 11:00:00", "fifth"),
+        ],
+    )
+    # Custom SQL that deliberately aliases columns as "value" and "count"
+    custom_sql = (
+        "select msg as value, id as count, ts from logs"
+    )
+    facet = DateFacet(
+        ds,
+        Request.fake("/?_facet_date=ts"),
+        database="test_date_facet_custom_sql",
+        sql=custom_sql,
+        table=None,
+    )
+    buckets, timed_out = await facet.facet_results()
+    assert timed_out == []
+    assert len(buckets) == 1
+    bucket = buckets[0]
+    assert bucket["name"] == "ts"
+    results_by_value = {r["value"]: r for r in bucket["results"]}
+    # The counts must be group counts (2 and 3), NOT the inner "count" column
+    # (which holds log IDs: 1, 2, 3, 4, 5)
+    assert results_by_value["2024-03-01"]["count"] == 2
+    assert results_by_value["2024-03-02"]["count"] == 3
+    # Values must be dates, not the inner "value" column (msg text)
+    for r in bucket["results"]:
+        assert r["value"].startswith("2024-"), (
+            f"Expected date, got inner 'value' alias: {r['value']}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_column_facet_with_value_and_count_columns():
+    # Regression test: ColumnFacet should also survive inner SQL that
+    # produces "value" and "count" columns.
+    ds = Datasette()
+    db = ds.add_memory_database("test_col_facet_conflict")
+    await db.execute_write(
+        "create table items(id integer primary key, category text, value text, count integer)"
+    )
+    await db.execute_write_many(
+        "insert into items (category, value, count) values (?, ?, ?)",
+        [
+            ("fruit", "apple_value", 10),
+            ("fruit", "banana_value", 20),
+            ("fruit", "cherry_value", 30),
+            ("veg", "carrot_value", 40),
+            ("veg", "pea_value", 50),
+        ],
+    )
+    facet = ColumnFacet(
+        ds,
+        Request.fake("/?_facet=category"),
+        database="test_col_facet_conflict",
+        sql="select * from items",
+        table="items",
+    )
+    buckets, timed_out = await facet.facet_results()
+    assert timed_out == []
+    assert len(buckets) == 1
+    bucket = buckets[0]
+    assert bucket["name"] == "category"
+    results_by_value = {r["value"]: r for r in bucket["results"]}
+    # Counts must be group counts, not the inner "count" column
+    assert results_by_value["fruit"]["count"] == 3
+    assert results_by_value["veg"]["count"] == 2
+    # Values must be categories, not the inner "value" column
+    assert set(results_by_value.keys()) == {"fruit", "veg"}
+
+
+@pytest.mark.asyncio
+async def test_date_facet_truncation_with_wrapped_query():
+    # Verify that the subquery wrapping does not break truncation detection
+    # when there are more date buckets than the facet size allows.
+    ds = Datasette([], settings={"default_facet_size": 3, "max_returned_rows": 100})
+    db = ds.add_memory_database("test_date_facet_trunc")
+    await db.execute_write("create table entries(id integer primary key, d text)")
+    # Insert 10 distinct dates, 2 rows each
+    for i in range(10):
+        for _ in range(2):
+            await db.execute_write(
+                "insert into entries (d) values (?)",
+                [f"2024-01-{i+1:02d}"],
+            )
+    facet = DateFacet(
+        ds,
+        Request.fake("/?_facet_date=d"),
+        database="test_date_facet_trunc",
+        sql="select * from entries",
+        table="entries",
+    )
+    buckets, timed_out = await facet.facet_results()
+    assert timed_out == []
+    assert len(buckets) == 1
+    bucket = buckets[0]
+    # facet_size is 3, so we should get 3 results and truncated=True
+    assert len(bucket["results"]) == 3
+    assert bucket["truncated"] is True
+    # Each bucket should have count == 2
+    for r in bucket["results"]:
+        assert r["count"] == 2
