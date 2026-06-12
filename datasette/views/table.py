@@ -401,57 +401,125 @@ class TableInsertView(BaseView):
         def _errors(errors):
             return None, errors, {}
 
-        if not request.headers.get("content-type").startswith("application/json"):
-            # TODO: handle form-encoded data
-            return _errors(["Invalid content-type, must be application/json"])
-        body = await request.post_body()
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError as e:
-            return _errors(["Invalid JSON: {}".format(e)])
-        if not isinstance(data, dict):
-            return _errors(["JSON must be a dictionary"])
-        keys = data.keys()
+        content_type = request.headers.get("content-type", "")
+        is_json = content_type.startswith("application/json")
+        is_form = content_type.startswith(
+            "application/x-www-form-urlencoded"
+        ) or content_type.startswith("multipart/form-data")
 
-        # keys must contain "row" or "rows"
-        if "row" not in keys and "rows" not in keys:
-            return _errors(['JSON must have one or other of "row" or "rows"'])
-        rows = []
-        if "row" in keys:
-            if "rows" in keys:
-                return _errors(['Cannot use "row" and "rows" at the same time'])
-            row = data["row"]
-            if not isinstance(row, dict):
-                return _errors(['"row" must be a dictionary'])
-            rows = [row]
-            data["return"] = True
+        if not is_json and not is_form:
+            return _errors(
+                [
+                    "Invalid content-type, must be application/json, "
+                    "application/x-www-form-urlencoded, or multipart/form-data"
+                ]
+            )
+
+        if is_json:
+            body = await request.post_body()
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as e:
+                return _errors(["Invalid JSON: {}".format(e)])
+            if not isinstance(data, dict):
+                return _errors(["JSON must be a dictionary"])
+            keys = data.keys()
+
+            # keys must contain "row" or "rows"
+            if "row" not in keys and "rows" not in keys:
+                return _errors(['JSON must have one or other of "row" or "rows"'])
+            rows = []
+            if "row" in keys:
+                if "rows" in keys:
+                    return _errors(['Cannot use "row" and "rows" at the same time'])
+                row = data["row"]
+                if not isinstance(row, dict):
+                    return _errors(['"row" must be a dictionary'])
+                rows = [row]
+                data["return"] = True
+            else:
+                rows = data["rows"]
+            if not isinstance(rows, list):
+                return _errors(['"rows" must be a list'])
+            for row in rows:
+                if not isinstance(row, dict):
+                    return _errors(['"rows" must be a list of dictionaries'])
+
+            # Does this exceed max_insert_rows?
+            max_insert_rows = self.ds.setting("max_insert_rows")
+            if len(rows) > max_insert_rows:
+                return _errors(
+                    ["Too many rows, maximum allowed is {}".format(max_insert_rows)]
+                )
+
+            # Validate other parameters
+            extras = {
+                key: value
+                for key, value in data.items()
+                if key not in ("row", "rows")
+            }
+            valid_extras = {"return", "ignore", "replace", "alter"}
+            invalid_extras = extras.keys() - valid_extras
+            if invalid_extras:
+                return _errors(
+                    [
+                        'Invalid parameter: "{}"'.format(
+                            '", "'.join(sorted(invalid_extras))
+                        )
+                    ]
+                )
+            if extras.get("ignore") and extras.get("replace"):
+                return _errors(
+                    ['Cannot use "ignore" and "replace" at the same time']
+                )
         else:
-            rows = data["rows"]
-        if not isinstance(rows, list):
-            return _errors(['"rows" must be a list'])
-        for row in rows:
-            if not isinstance(row, dict):
-                return _errors(['"rows" must be a list of dictionaries'])
+            # Form data: application/x-www-form-urlencoded or multipart/form-data
+            try:
+                form = await request.form()
+            except BadRequest as e:
+                return _errors(["Invalid form data: {}".format(e)])
 
-        # Does this exceed max_insert_rows?
-        max_insert_rows = self.ds.setting("max_insert_rows")
-        if len(rows) > max_insert_rows:
-            return _errors(
-                ["Too many rows, maximum allowed is {}".format(max_insert_rows)]
-            )
+            # Extract special underscore-prefixed parameters as extras
+            form_extras = {}
+            row = {}
+            valid_form_extras = {
+                "_return": "return",
+                "_ignore": "ignore",
+                "_replace": "replace",
+                "_alter": "alter",
+            }
+            for key, value in form.items():
+                if key in valid_form_extras:
+                    mapped = valid_form_extras[key]
+                    if isinstance(value, str):
+                        value = value.lower() in {"1", "true", "t", "yes", "on"}
+                    form_extras[mapped] = value
+                else:
+                    row[key] = value
 
-        # Validate other parameters
-        extras = {
-            key: value for key, value in data.items() if key not in ("row", "rows")
-        }
-        valid_extras = {"return", "ignore", "replace", "alter"}
-        invalid_extras = extras.keys() - valid_extras
-        if invalid_extras:
-            return _errors(
-                ['Invalid parameter: "{}"'.format('", "'.join(sorted(invalid_extras)))]
-            )
-        if extras.get("ignore") and extras.get("replace"):
-            return _errors(['Cannot use "ignore" and "replace" at the same time'])
+            rows = [row]
+            # Form submissions always return the row (like JSON "row" mode)
+            form_extras["return"] = True
+
+            # Check for invalid extra parameters
+            invalid_form_keys = set()
+            for key in form.keys():
+                if key.startswith("_") and key not in valid_form_extras:
+                    invalid_form_keys.add(key)
+            if invalid_form_keys:
+                return _errors(
+                    [
+                        'Invalid parameter: "{}"'.format(
+                            '", "'.join(sorted(invalid_form_keys))
+                        )
+                    ]
+                )
+
+            extras = form_extras
+            if extras.get("ignore") and extras.get("replace"):
+                return _errors(
+                    ['Cannot use "ignore" and "replace" at the same time']
+                )
 
         columns = set(await db.table_columns(table_name))
         columns.update(pks_list)

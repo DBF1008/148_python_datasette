@@ -208,7 +208,10 @@ async def test_insert_rows(ds_write, return_rows):
             {},
             "invalid_content_type",
             400,
-            ["Invalid content-type, must be application/json"],
+            [
+                "Invalid content-type, must be application/json, "
+                "application/x-www-form-urlencoded, or multipart/form-data"
+            ],
         ),
         (
             "/data/docs/-/insert",
@@ -424,6 +427,112 @@ async def test_insert_or_upsert_row_errors(
         await ds_write.get_database("data").execute("select count(*) from docs")
     ).rows[0][0] == 0
     assert before_count == after_count
+
+
+@pytest.mark.asyncio
+async def test_insert_row_form_urlencoded(ds_write):
+    "Single row insert via application/x-www-form-urlencoded"
+    token = write_token(ds_write)
+    response = await ds_write.client.post(
+        "/data/docs/-/insert",
+        data={"title": "Form Test", "score": "1.2", "age": "5"},
+        headers={"Authorization": "Bearer {}".format(token)},
+    )
+    assert response.status_code == 201
+    assert response.json()["ok"] is True
+    assert response.json()["rows"] == [
+        {"id": 1, "title": "Form Test", "score": 1.2, "age": 5}
+    ]
+    rows = (await ds_write.get_database("data").execute("select * from docs")).dicts()
+    assert rows[0] == {"id": 1, "title": "Form Test", "score": 1.2, "age": 5}
+
+
+@pytest.mark.asyncio
+async def test_insert_row_form_multipart(ds_write):
+    "Single row insert via multipart/form-data"
+    token = write_token(ds_write)
+    response = await ds_write.client.post(
+        "/data/docs/-/insert",
+        files={
+            "title": (None, "Multipart Test"),
+            "score": (None, "2.5"),
+            "age": (None, "10"),
+        },
+        headers={"Authorization": "Bearer {}".format(token)},
+    )
+    assert response.status_code == 201
+    assert response.json()["ok"] is True
+    assert response.json()["rows"] == [
+        {"id": 1, "title": "Multipart Test", "score": 2.5, "age": 10}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_insert_form_with_extras(ds_write):
+    "Form insert with _alter=1 to add a new column"
+    token = write_token(ds_write)
+    response = await ds_write.client.post(
+        "/data/docs/-/insert",
+        data={"title": "Alter Test", "extra_col": "value", "_alter": "1"},
+        headers={"Authorization": "Bearer {}".format(token)},
+    )
+    assert response.status_code == 201
+    assert response.json()["ok"] is True
+    assert response.json()["rows"][0]["extra_col"] == "value"
+
+
+@pytest.mark.asyncio
+async def test_upsert_row_form_urlencoded(ds_write):
+    "Upsert via application/x-www-form-urlencoded"
+    token = write_token(ds_write)
+    # First insert a row via JSON
+    response = await ds_write.client.post(
+        "/data/docs/-/insert",
+        json={"row": {"id": 1, "title": "Original", "score": 1.0, "age": 10}},
+        headers=_headers(token),
+    )
+    assert response.status_code == 201
+    # Now upsert via form data
+    response = await ds_write.client.post(
+        "/data/docs/-/upsert",
+        data={"id": "1", "title": "Updated", "score": "2.0", "age": "20"},
+        headers={"Authorization": "Bearer {}".format(token)},
+    )
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    rows = (await ds_write.get_database("data").execute("select * from docs")).dicts()
+    assert rows[0] == {"id": 1, "title": "Updated", "score": 2.0, "age": 20}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "form_data,expected_status,expected_errors",
+    (
+        (
+            {"title": "Test", "_badparam": "1"},
+            400,
+            ['Invalid parameter: "_badparam"'],
+        ),
+        (
+            {"title": "Test", "_ignore": "1", "_replace": "1"},
+            400,
+            ['Cannot use "ignore" and "replace" at the same time'],
+        ),
+    ),
+)
+async def test_insert_form_errors(
+    ds_write, form_data, expected_status, expected_errors
+):
+    "Form data error cases"
+    token = write_token(ds_write)
+    response = await ds_write.client.post(
+        "/data/docs/-/insert",
+        data=form_data,
+        headers={"Authorization": "Bearer {}".format(token)},
+    )
+    assert response.status_code == expected_status
+    assert response.json()["ok"] is False
+    assert response.json()["errors"] == expected_errors
 
 
 @pytest.mark.asyncio
