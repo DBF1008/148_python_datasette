@@ -208,7 +208,10 @@ async def test_insert_rows(ds_write, return_rows):
             {},
             "invalid_content_type",
             400,
-            ["Invalid content-type, must be application/json"],
+            [
+                "Invalid content-type, must be application/json, "
+                "application/x-www-form-urlencoded or multipart/form-data"
+            ],
         ),
         (
             "/data/docs/-/insert",
@@ -1695,3 +1698,226 @@ async def test_create_using_alter_against_existing_table(
         insert_rows_event = ds_write._tracked_events[1]
         assert insert_rows_event.name == "insert-rows"
         assert insert_rows_event.num_rows == 1
+
+
+# ---------------------------------------------------------------------------
+# Form-encoded inserts: a form submission is treated as a single-row insert,
+# equivalent to a JSON {"row": {...}} body, so JSON semantics, primary-key
+# validation, the response shape and error reporting all stay the same.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_insert_row_form_urlencoded(ds_write):
+    # The exact data test_insert_row sends as JSON, sent as a form instead,
+    # must produce the identical typed row in the response and the database.
+    token = write_token(ds_write)
+    response = await ds_write.client.post(
+        "/data/docs/-/insert",
+        data={"title": "Test", "score": "1.2", "age": "5"},
+        headers={"Authorization": "Bearer {}".format(token)},
+    )
+    expected_row = {"id": 1, "title": "Test", "score": 1.2, "age": 5}
+    assert response.status_code == 201
+    assert response.json()["ok"] is True
+    assert response.json()["rows"] == [expected_row]
+    rows = (await ds_write.get_database("data").execute("select * from docs")).dicts()
+    assert rows[0] == expected_row
+    # Analytics event matches the JSON path
+    event = last_event(ds_write)
+    assert event.name == "insert-rows"
+    assert event.num_rows == 1
+    assert not event.ignore
+    assert not event.replace
+
+
+@pytest.mark.asyncio
+async def test_insert_row_form_multipart(ds_write):
+    # multipart/form-data (httpx sends one when files= is used; (None, value)
+    # encodes a plain text field) inserts the same way as urlencoded.
+    token = write_token(ds_write)
+    response = await ds_write.client.post(
+        "/data/docs/-/insert",
+        files={
+            "title": (None, "Multi"),
+            "score": (None, "3.5"),
+            "age": (None, "9"),
+        },
+        headers={"Authorization": "Bearer {}".format(token)},
+    )
+    expected_row = {"id": 1, "title": "Multi", "score": 3.5, "age": 9}
+    assert response.status_code == 201
+    assert response.json()["rows"] == [expected_row]
+    rows = (await ds_write.get_database("data").execute("select * from docs")).dicts()
+    assert rows[0] == expected_row
+
+
+@pytest.mark.asyncio
+async def test_insert_form_ignore_true(ds_write):
+    # ignore=true must be parsed as a real boolean, so a duplicate primary key
+    # is silently skipped.
+    token = write_token(ds_write)
+    auth = {"Authorization": "Bearer {}".format(token)}
+    first = await ds_write.client.post(
+        "/data/docs/-/insert", data={"id": "1", "title": "Original"}, headers=auth
+    )
+    assert first.status_code == 201
+    dup = await ds_write.client.post(
+        "/data/docs/-/insert",
+        data={"id": "1", "title": "Changed", "ignore": "true"},
+        headers=auth,
+    )
+    assert dup.status_code == 201
+    rows = (
+        await ds_write.get_database("data").execute("select title from docs")
+    ).dicts()
+    assert rows == [{"title": "Original"}]
+
+
+@pytest.mark.asyncio
+async def test_insert_form_replace_true(ds_write):
+    token = write_token(ds_write)
+    auth = {"Authorization": "Bearer {}".format(token)}
+    await ds_write.client.post(
+        "/data/docs/-/insert", data={"id": "1", "title": "Original"}, headers=auth
+    )
+    response = await ds_write.client.post(
+        "/data/docs/-/insert",
+        data={"id": "1", "title": "Replaced", "replace": "true"},
+        headers=auth,
+    )
+    assert response.status_code == 201
+    rows = (
+        await ds_write.get_database("data").execute("select title from docs")
+    ).dicts()
+    assert rows == [{"title": "Replaced"}]
+
+
+@pytest.mark.asyncio
+async def test_insert_form_ignore_false_still_conflicts(ds_write):
+    # "false" must parse to False (not a truthy string), so a duplicate key
+    # still errors instead of being silently ignored.
+    token = write_token(ds_write)
+    auth = {"Authorization": "Bearer {}".format(token)}
+    await ds_write.client.post(
+        "/data/docs/-/insert", data={"id": "1", "title": "Original"}, headers=auth
+    )
+    response = await ds_write.client.post(
+        "/data/docs/-/insert",
+        data={"id": "1", "title": "Changed", "ignore": "false"},
+        headers=auth,
+    )
+    assert response.status_code == 400
+    assert response.json()["errors"] == ["UNIQUE constraint failed: docs.id"]
+
+
+@pytest.mark.asyncio
+async def test_upsert_form(ds_write):
+    # Upsert via a form still honours the primary key and returns status 200.
+    token = write_token(ds_write)
+    auth = {"Authorization": "Bearer {}".format(token)}
+    await ds_write.client.post(
+        "/data/docs/-/insert", data={"id": "1", "title": "Original"}, headers=auth
+    )
+    response = await ds_write.client.post(
+        "/data/docs/-/upsert",
+        data={"id": "1", "title": "Upserted"},
+        headers=auth,
+    )
+    assert response.status_code == 200
+    rows = (
+        await ds_write.get_database("data").execute("select title from docs")
+    ).dicts()
+    assert rows == [{"title": "Upserted"}]
+
+
+@pytest.mark.asyncio
+async def test_upsert_form_missing_pk(ds_write):
+    # Primary-key validation is unchanged for forms: upsert without the pk errors.
+    token = write_token(ds_write)
+    response = await ds_write.client.post(
+        "/data/docs/-/upsert",
+        data={"title": "NoPrimaryKey"},
+        headers={"Authorization": "Bearer {}".format(token)},
+    )
+    assert response.status_code == 400
+    assert "missing primary key" in response.json()["errors"][0].lower()
+
+
+@pytest.mark.asyncio
+async def test_insert_form_invalid_bool(ds_write):
+    token = write_token(ds_write)
+    response = await ds_write.client.post(
+        "/data/docs/-/insert",
+        data={"title": "X", "ignore": "maybe"},
+        headers={"Authorization": "Bearer {}".format(token)},
+    )
+    assert response.status_code == 400
+    assert response.json()["errors"] == [
+        'Invalid value for "ignore": use a boolean like "true"/"false" or "1"/"0"'
+    ]
+
+
+@pytest.mark.asyncio
+async def test_insert_form_empty(ds_write):
+    token = write_token(ds_write)
+    response = await ds_write.client.post(
+        "/data/docs/-/insert",
+        content="",
+        headers={
+            "Authorization": "Bearer {}".format(token),
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["errors"] == [
+        "Form submission must include at least one column field"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_insert_form_invalid_column(ds_write):
+    # Column validation is shared with the JSON path.
+    token = write_token(ds_write)
+    response = await ds_write.client.post(
+        "/data/docs/-/insert",
+        data={"title": "X", "nonexistent": "y"},
+        headers={"Authorization": "Bearer {}".format(token)},
+    )
+    assert response.status_code == 400
+    assert "invalid columns" in response.json()["errors"][0].lower()
+
+
+@pytest.mark.asyncio
+async def test_insert_unsupported_content_type(ds_write):
+    token = write_token(ds_write)
+    response = await ds_write.client.post(
+        "/data/docs/-/insert",
+        content="title=X",
+        headers={
+            "Authorization": "Bearer {}".format(token),
+            "Content-Type": "text/plain",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["errors"] == [
+        "Invalid content-type, must be application/json, "
+        "application/x-www-form-urlencoded or multipart/form-data"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_insert_missing_content_type(ds_write):
+    # A missing Content-Type must give a clear error, not a 500.
+    token = write_token(ds_write)
+    response = await ds_write.client.request(
+        "POST",
+        "/data/docs/-/insert",
+        content="title=X",
+        headers={"Authorization": "Bearer {}".format(token)},
+    )
+    assert response.status_code == 400
+    assert response.json()["errors"] == [
+        "Invalid content-type, must be application/json, "
+        "application/x-www-form-urlencoded or multipart/form-data"
+    ]

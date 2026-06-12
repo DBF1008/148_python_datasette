@@ -380,6 +380,23 @@ async def display_columns_and_rows(
     return columns, cell_rows
 
 
+# Form fields are always strings, so the reserved control keys (which are real
+# booleans in the JSON API) need parsing. These cover the common HTML form and
+# automation-client conventions for representing true/false.
+_FORM_TRUTHY = {"1", "true", "yes", "on", "t", "y"}
+_FORM_FALSY = {"0", "false", "no", "off", "f", "n", ""}
+
+
+def _parse_form_bool(value):
+    """Parse a form field value into a bool, or None if it is unrecognized."""
+    normalized = value.strip().lower()
+    if normalized in _FORM_TRUTHY:
+        return True
+    if normalized in _FORM_FALSY:
+        return False
+    return None
+
+
 class TableInsertView(BaseView):
     name = "table-insert"
 
@@ -401,14 +418,32 @@ class TableInsertView(BaseView):
         def _errors(errors):
             return None, errors, {}
 
-        if not request.headers.get("content-type").startswith("application/json"):
-            # TODO: handle form-encoded data
-            return _errors(["Invalid content-type, must be application/json"])
-        body = await request.post_body()
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError as e:
-            return _errors(["Invalid JSON: {}".format(e)])
+        content_type = (
+            (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+        )
+        if content_type == "application/json":
+            body = await request.post_body()
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as e:
+                return _errors(["Invalid JSON: {}".format(e)])
+        elif content_type in (
+            "application/x-www-form-urlencoded",
+            "multipart/form-data",
+        ):
+            # A common form submission maps to a single-row insert, equivalent
+            # to a JSON {"row": {...}} body. It then flows through exactly the
+            # same validation below, so JSON semantics stay unchanged.
+            data, form_errors = await self._form_to_data(request)
+            if form_errors:
+                return _errors(form_errors)
+        else:
+            return _errors(
+                [
+                    "Invalid content-type, must be application/json, "
+                    "application/x-www-form-urlencoded or multipart/form-data"
+                ]
+            )
         if not isinstance(data, dict):
             return _errors(["JSON must be a dictionary"])
         keys = data.keys()
@@ -483,6 +518,48 @@ class TableInsertView(BaseView):
         if errors:
             return _errors(errors)
         return rows, errors, extras
+
+    async def _form_to_data(self, request):
+        """Turn a form submission into the same dict shape as a JSON body.
+
+        A form post represents inserting a single row: each field is a column
+        value, except the reserved control keys (return/ignore/replace/alter)
+        which map onto the top-level options of the JSON API. The returned
+        dict is handed to the same validation as a JSON {"row": {...}} body,
+        so primary-key handling, column checks and the response are identical.
+
+        Returns (data, errors); data is None whenever errors is non-empty.
+        """
+        try:
+            form = await request.form(files=False)
+        except BadRequest as e:
+            return None, ["Invalid form data: {}".format(e)]
+
+        control_keys = {"return", "ignore", "replace", "alter"}
+        row = {}
+        extras = {}
+        errors = []
+        # files=False guarantees every value here is a string. Later duplicate
+        # field names overwrite earlier ones, matching urlencoded dict parsing.
+        for key, value in form.items():
+            if key in control_keys:
+                parsed = _parse_form_bool(value)
+                if parsed is None:
+                    errors.append(
+                        'Invalid value for "{}": use a boolean like '
+                        '"true"/"false" or "1"/"0"'.format(key)
+                    )
+                else:
+                    extras[key] = parsed
+            else:
+                row[key] = value
+        if errors:
+            return None, errors
+        if not row:
+            return None, ["Form submission must include at least one column field"]
+        data = {"row": row}
+        data.update(extras)
+        return data, None
 
     async def post(self, request, upsert=False):
         try:
