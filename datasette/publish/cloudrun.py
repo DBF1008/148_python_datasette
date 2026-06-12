@@ -2,6 +2,7 @@ from datasette import hookimpl
 import click
 import json
 import os
+import pathlib
 import re
 from subprocess import CalledProcessError, check_call, check_output
 
@@ -83,6 +84,12 @@ def publish_subcommand(publish):
         default=None,
         help="Project ID for Artifact Registry (defaults to the active project)",
     )
+    @click.option(
+        "--generate-dir",
+        type=click.Path(file_okay=False, dir_okay=True),
+        default=None,
+        help="Output generated build artifacts to this directory and stop without deploying",
+    )
     def cloudrun(
         files,
         metadata,
@@ -115,51 +122,58 @@ def publish_subcommand(publish):
         artifact_repository,
         artifact_region,
         artifact_project,
+        generate_dir,
     ):
         "Publish databases to Datasette running on Cloud Run"
-        fail_if_publish_binary_not_installed(
-            "gcloud", "Google Cloud", "https://cloud.google.com/sdk/"
-        )
-        project = check_output(
-            "gcloud config get-value project", shell=True, universal_newlines=True
-        ).strip()
+        if generate_dir:
+            if pathlib.Path(generate_dir).exists():
+                raise click.ClickException(
+                    "Directory {} already exists".format(generate_dir)
+                )
+        if not generate_dir:
+            fail_if_publish_binary_not_installed(
+                "gcloud", "Google Cloud", "https://cloud.google.com/sdk/"
+            )
+            project = check_output(
+                "gcloud config get-value project", shell=True, universal_newlines=True
+            ).strip()
 
-        artifact_project = artifact_project or project
+            artifact_project = artifact_project or project
 
-        # Ensure Artifact Registry exists for the target image
-        _ensure_artifact_registry(
-            artifact_project=artifact_project,
-            artifact_region=artifact_region,
-            artifact_repository=artifact_repository,
-        )
+            # Ensure Artifact Registry exists for the target image
+            _ensure_artifact_registry(
+                artifact_project=artifact_project,
+                artifact_region=artifact_region,
+                artifact_repository=artifact_repository,
+            )
 
-        artifact_host = (
-            artifact_region
-            if artifact_region.endswith("-docker.pkg.dev")
-            else f"{artifact_region}-docker.pkg.dev"
-        )
+            artifact_host = (
+                artifact_region
+                if artifact_region.endswith("-docker.pkg.dev")
+                else f"{artifact_region}-docker.pkg.dev"
+            )
 
-        if not service:
-            # Show the user their current services, then prompt for one
-            click.echo("Please provide a service name for this deployment\n")
-            click.echo("Using an existing service name will over-write it")
-            click.echo("")
-            existing_services = get_existing_services()
-            if existing_services:
-                click.echo("Your existing services:\n")
-                for existing_service in existing_services:
-                    click.echo(
-                        "  {name} - created {created} - {url}".format(
-                            **existing_service
-                        )
-                    )
+            if not service:
+                # Show the user their current services, then prompt for one
+                click.echo("Please provide a service name for this deployment\n")
+                click.echo("Using an existing service name will over-write it")
                 click.echo("")
-            service = click.prompt("Service name", type=str)
+                existing_services = get_existing_services()
+                if existing_services:
+                    click.echo("Your existing services:\n")
+                    for existing_service in existing_services:
+                        click.echo(
+                            "  {name} - created {created} - {url}".format(
+                                **existing_service
+                            )
+                        )
+                    click.echo("")
+                service = click.prompt("Service name", type=str)
 
-        image_id = (
-            f"{artifact_host}/{artifact_project}/"
-            f"{artifact_repository}/datasette-{service}"
-        )
+            image_id = (
+                f"{artifact_host}/{artifact_project}/"
+                f"{artifact_repository}/datasette-{service}"
+            )
 
         extra_metadata = {
             "title": title,
@@ -206,6 +220,7 @@ def publish_subcommand(publish):
             extra_metadata,
             environment_variables,
             apt_get_extras=apt_get_extras,
+            output_dir=generate_dir,
         ):
             if show_files:
                 if os.path.exists("metadata.json"):
@@ -216,6 +231,15 @@ def publish_subcommand(publish):
                 with open("Dockerfile") as fp:
                     print(fp.read())
                 print("\n====================\n")
+
+            if generate_dir:
+                # Generate-only mode: artifacts are on disk, stop here.
+                click.echo(
+                    "Build artifacts written to {}".format(
+                        os.path.join(generate_dir, name)
+                    )
+                )
+                return
 
             check_call(
                 "gcloud builds submit --tag {}{}".format(

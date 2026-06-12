@@ -521,12 +521,22 @@ def temporary_docker_directory(
     environment_variables=None,
     port=8001,
     apt_get_extras=None,
+    output_dir=None,
 ):
     extra_metadata = extra_metadata or {}
-    tmp = tempfile.TemporaryDirectory()
+    if output_dir:
+        # Use the caller-specified directory as a persistent base instead of
+        # a throw-away temp dir.  Create it (and the inner datasette
+        # sub-directory) if they do not yet exist.
+        os.makedirs(output_dir, exist_ok=True)
+        base_dir = output_dir
+        tmp = None
+    else:
+        tmp = tempfile.TemporaryDirectory()
+        base_dir = tmp.name
     # We create a datasette folder in there to get a nicer now deploy name
-    datasette_dir = os.path.join(tmp.name, name)
-    os.mkdir(datasette_dir)
+    datasette_dir = os.path.join(base_dir, name)
+    os.makedirs(datasette_dir, exist_ok=True)
     saved_cwd = os.getcwd()
     file_paths = [os.path.join(saved_cwd, file_path) for file_path in files]
     file_names = [os.path.split(f)[-1] for f in files]
@@ -580,7 +590,8 @@ def temporary_docker_directory(
             )
         yield datasette_dir
     finally:
-        tmp.cleanup()
+        if tmp is not None:
+            tmp.cleanup()
         os.chdir(saved_cwd)
 
 

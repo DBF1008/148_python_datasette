@@ -400,3 +400,226 @@ def test_publish_cloudrun_extra_options(
         .strip()
     )
     assert extra_options == expected
+
+
+@pytest.mark.serial
+def test_publish_cloudrun_output_dir(tmp_path_factory):
+    """--generate-dir writes Dockerfile/metadata.json to disk without calling gcloud."""
+    runner = CliRunner()
+    work = tmp_path_factory.mktemp("runner")
+    os.chdir(work)
+    with open("test.db", "w") as fp:
+        fp.write("data")
+    output = work / "build_output"
+    result = runner.invoke(
+        cli.cli,
+        [
+            "publish",
+            "cloudrun",
+            "test.db",
+            "--generate-dir",
+            str(output),
+            "--secret",
+            "x-secret",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # Artifacts live in generate_dir/name (name defaults to "datasette")
+    artifacts = output / "datasette"
+    assert artifacts.is_dir()
+    dockerfile_path = artifacts / "Dockerfile"
+    assert dockerfile_path.exists()
+    dockerfile_content = dockerfile_path.read_text()
+    assert "FROM python:3.11.0-slim-bullseye" in dockerfile_content
+    assert "ENV DATASETTE_SECRET 'x-secret'" in dockerfile_content
+    # Database is copied into the artifacts directory
+    assert (artifacts / "test.db").exists()
+    # No gcloud calls were made (gcloud is not even required)
+    assert "gcloud" not in result.output
+
+
+@pytest.mark.serial
+def test_publish_cloudrun_output_dir_with_show_files(tmp_path_factory):
+    """--generate-dir combined with --show-files prints files AND persists them."""
+    runner = CliRunner()
+    work = tmp_path_factory.mktemp("runner")
+    os.chdir(work)
+    with open("test.db", "w") as fp:
+        fp.write("data")
+    with open("metadata.yml", "w") as fp:
+        fp.write("title: Output Dir Test\n")
+    output = work / "build_output"
+    result = runner.invoke(
+        cli.cli,
+        [
+            "publish",
+            "cloudrun",
+            "test.db",
+            "--metadata",
+            "metadata.yml",
+            "--generate-dir",
+            str(output),
+            "--show-files",
+            "--secret",
+            "x-secret",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # --show-files prints to stdout
+    assert "=== metadata.json ===" in result.output
+    assert "==== Dockerfile ====" in result.output
+    # Files are also on disk
+    artifacts = output / "datasette"
+    assert (artifacts / "metadata.json").exists()
+    metadata = json.loads((artifacts / "metadata.json").read_text())
+    assert metadata["title"] == "Output Dir Test"
+    assert (artifacts / "Dockerfile").exists()
+
+
+@pytest.mark.serial
+def test_publish_cloudrun_output_dir_plugin_secrets(tmp_path_factory):
+    """Plugin secrets appear as ENV vars in Dockerfile and $env refs in metadata."""
+    runner = CliRunner()
+    work = tmp_path_factory.mktemp("runner")
+    os.chdir(work)
+    with open("test.db", "w") as fp:
+        fp.write("data")
+    output = work / "build_output"
+    result = runner.invoke(
+        cli.cli,
+        [
+            "publish",
+            "cloudrun",
+            "test.db",
+            "--generate-dir",
+            str(output),
+            "--plugin-secret",
+            "datasette-auth-github",
+            "client_id",
+            "x-client-id",
+            "--secret",
+            "x-secret",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    artifacts = output / "datasette"
+    # Dockerfile carries the ENV
+    dockerfile = (artifacts / "Dockerfile").read_text()
+    assert "ENV DATASETTE_AUTH_GITHUB_CLIENT_ID 'x-client-id'" in dockerfile
+    # metadata.json uses $env references
+    metadata = json.loads((artifacts / "metadata.json").read_text())
+    assert metadata["plugins"]["datasette-auth-github"]["client_id"] == {
+        "$env": "DATASETTE_AUTH_GITHUB_CLIENT_ID"
+    }
+
+
+@pytest.mark.serial
+def test_publish_cloudrun_output_dir_static_templates_plugins(tmp_path_factory):
+    """template_dir, plugins_dir, and static mounts are copied into the output."""
+    runner = CliRunner()
+    work = tmp_path_factory.mktemp("runner")
+    os.chdir(work)
+    with open("test.db", "w") as fp:
+        fp.write("data")
+    # Create supporting directories
+    tpl = work / "my_templates"
+    tpl.mkdir()
+    (tpl / "base.html").write_text("<html>base</html>")
+    plugins = work / "my_plugins"
+    plugins.mkdir()
+    (plugins / "my_plugin.py").write_text("# plugin")
+    static_css = work / "static_css"
+    static_css.mkdir()
+    (static_css / "style.css").write_text("body {}")
+    output = work / "build_output"
+    result = runner.invoke(
+        cli.cli,
+        [
+            "publish",
+            "cloudrun",
+            "test.db",
+            "--generate-dir",
+            str(output),
+            "--template-dir",
+            str(tpl),
+            "--plugins-dir",
+            str(plugins),
+            "--static",
+            "css:{}".format(str(static_css)),
+            "--secret",
+            "x-secret",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    artifacts = output / "datasette"
+    # Templates
+    assert (artifacts / "templates" / "base.html").exists()
+    assert (artifacts / "templates" / "base.html").read_text() == "<html>base</html>"
+    # Plugins
+    assert (artifacts / "plugins" / "my_plugin.py").exists()
+    # Static mount
+    assert (artifacts / "css" / "style.css").exists()
+
+
+@pytest.mark.serial
+@mock.patch("shutil.which")
+@mock.patch("datasette.publish.cloudrun.check_output")
+@mock.patch("datasette.publish.cloudrun.check_call")
+def test_publish_cloudrun_output_dir_skips_gcloud(
+    mock_call, mock_output, mock_which, tmp_path_factory
+):
+    """When --generate-dir is given, no gcloud commands should run at all."""
+    mock_which.return_value = True
+    mock_output.return_value = "myproject"
+    runner = CliRunner()
+    work = tmp_path_factory.mktemp("runner")
+    os.chdir(work)
+    with open("test.db", "w") as fp:
+        fp.write("data")
+    output = work / "build_output"
+    result = runner.invoke(
+        cli.cli,
+        [
+            "publish",
+            "cloudrun",
+            "test.db",
+            "--generate-dir",
+            str(output),
+            "--secret",
+            "x-secret",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # Neither check_call nor check_output should have been invoked
+    mock_call.assert_not_called()
+    mock_output.assert_not_called()
+    # The artifacts directory exists and contains the expected files
+    artifacts = output / "datasette"
+    assert (artifacts / "Dockerfile").exists()
+    assert (artifacts / "test.db").exists()
+
+
+@pytest.mark.serial
+def test_publish_cloudrun_output_dir_already_exists(tmp_path_factory):
+    """--generate-dir should refuse to overwrite an existing directory."""
+    runner = CliRunner()
+    work = tmp_path_factory.mktemp("runner")
+    os.chdir(work)
+    with open("test.db", "w") as fp:
+        fp.write("data")
+    output = work / "build_output"
+    output.mkdir()  # pre-create so the guard triggers
+    result = runner.invoke(
+        cli.cli,
+        [
+            "publish",
+            "cloudrun",
+            "test.db",
+            "--generate-dir",
+            str(output),
+            "--secret",
+            "x-secret",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "already exists" in result.output
