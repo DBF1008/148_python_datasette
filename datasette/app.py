@@ -1791,6 +1791,84 @@ class Datasette:
             _limit=limit,
         )
 
+    async def visible_databases_and_tables(
+        self,
+        actor: dict | None,
+        *,
+        include_private: bool = False,
+    ) -> list:
+        """
+        Return the databases and their tables/views that the actor can see.
+
+        This is the shared resource-enumeration used by the homepage, the API
+        explorer and the create-token page so that all three present a
+        consistent set of resources for the same actor.
+
+        Returns a list of dicts, one per visible database, ordered by database
+        name::
+
+            [
+                {
+                    "name": database_name,
+                    "private": bool,  # False unless include_private=True
+                    "tables": [{"name": table, "private": bool}, ...],
+                    "views": [{"name": view, "private": bool}, ...],
+                },
+                ...
+            ]
+
+        Each child is classified as a table or a view. No database is special
+        cased - membership is decided purely by view-database / view-table
+        visibility, so ``_memory`` appears exactly when it is registered and
+        visible. Per-entry ``private`` flags are only meaningful when
+        ``include_private=True``; otherwise they are always ``False``.
+
+        This method deliberately does NOT add any per-resource display metadata
+        (row counts, columns, primary keys, write links, ...) - callers layer
+        those on top of the returned set.
+        """
+        db_page = await self.allowed_resources(
+            "view-database", actor, include_is_private=include_private
+        )
+        visible_databases = [r async for r in db_page.all()]
+
+        table_page = await self.allowed_resources(
+            "view-table", actor, include_is_private=include_private
+        )
+        children_by_database = {}
+        async for child_resource in table_page.all():
+            children_by_database.setdefault(child_resource.parent, []).append(
+                child_resource
+            )
+
+        result = []
+        for db_resource in visible_databases:
+            database_name = db_resource.parent
+            db = self.databases.get(database_name)
+            view_names = set(await db.view_names()) if db is not None else set()
+
+            tables = []
+            views = []
+            for child_resource in children_by_database.get(database_name, []):
+                entry = {
+                    "name": child_resource.child,
+                    "private": getattr(child_resource, "private", False),
+                }
+                if child_resource.child in view_names:
+                    views.append(entry)
+                else:
+                    tables.append(entry)
+
+            result.append(
+                {
+                    "name": database_name,
+                    "private": getattr(db_resource, "private", False),
+                    "tables": tables,
+                    "views": views,
+                }
+            )
+        return result
+
     async def allowed(
         self,
         *,

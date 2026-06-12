@@ -1185,6 +1185,122 @@ async def test_api_explorer_visibility(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "is_logged_in,config",
+    (
+        # Open instance, anonymous user sees everything
+        (False, None),
+        # Logged-in user can only see perms_ds_one
+        (
+            True,
+            {
+                "databases": {
+                    "perms_ds_one": {"allow": {"id": "user"}},
+                    "perms_ds_two": {"allow": False},
+                }
+            },
+        ),
+        # Logged-in user sees perms_ds_one but table t2 is hidden
+        (
+            True,
+            {
+                "databases": {
+                    "perms_ds_one": {
+                        "allow": {"id": "user"},
+                        "tables": {"t2": {"allow": False}},
+                    },
+                    "perms_ds_two": {"allow": False},
+                }
+            },
+        ),
+    ),
+)
+async def test_visible_real_tables_consistent_across_entrypoints(
+    perms_ds, is_logged_in, config
+):
+    # Regression: the homepage and the API explorer must agree, for the same
+    # actor, on exactly which real tables are visible. They previously used two
+    # different enumeration mechanisms (catalog vs live sqlite_master) and could
+    # drift apart - a table visible in one entrypoint could vanish in another.
+    prev_config = perms_ds.config
+    perms_ds.config = config or {}
+    try:
+        actor = {"id": "user"} if is_logged_in else None
+        kwargs = {"actor": actor} if actor else {}
+
+        # Ground truth: the shared collector both entrypoints now consume.
+        shared = await perms_ds.visible_databases_and_tables(actor)
+        expected_real_tables = sorted(
+            "{}/{}".format(db["name"], table["name"])
+            for db in shared
+            for table in db["tables"]
+        )
+
+        # API explorer - real tables come from the "Get rows for" links.
+        api_response = await perms_ds.client.get("/-/api", **kwargs)
+        assert api_response.status_code == 200
+        api_real_tables = sorted(
+            match[0] for match in _visible_tables_re.findall(api_response.text)
+        )
+
+        # Homepage JSON - table entries carry a "columns" key, views do not.
+        index_response = await perms_ds.client.get("/.json", **kwargs)
+        assert index_response.status_code == 200
+        index_databases = index_response.json()["databases"]
+        index_real_tables = sorted(
+            "{}/{}".format(database_name, item["name"])
+            for database_name, database in index_databases.items()
+            for item in database["tables_and_views_truncated"]
+            if "columns" in item
+        )
+
+        assert api_real_tables == expected_real_tables
+        assert index_real_tables == expected_real_tables
+    finally:
+        perms_ds.config = prev_config
+
+
+@pytest.mark.asyncio
+async def test_create_token_matches_shared_resources_and_lists_memory(perms_ds):
+    # Regression: create-token used to hard-skip the _memory database and
+    # collected resources independently. It must now share the same visible
+    # resource set as the other entrypoints (tables + views) and no longer
+    # special case _memory.
+    actor = {"id": "root"}
+    shared = await perms_ds.visible_databases_and_tables(actor)
+    expected_children = sorted(
+        "{}/{}".format(db["name"], child["name"])
+        for db in shared
+        for child in (db["tables"] + db["views"])
+    )
+
+    response = await perms_ds.client.get("/-/create-token", actor=actor)
+    assert response.status_code == 200
+    soup = Soup(response.text, "html.parser")
+    checkbox_names = {el["name"] for el in soup.select('input[type="checkbox"]')}
+
+    resource_children = sorted(
+        {
+            "{}/{}".format(name.split(":")[1], name.split(":")[2])
+            for name in checkbox_names
+            if name.startswith("resource:")
+        }
+    )
+    assert resource_children == expected_children
+
+    # The view perms_ds_one/v1 is a restrictable resource here even though the
+    # API explorer deliberately does not surface views.
+    assert "perms_ds_one/v1" in resource_children
+
+    # _memory is no longer special cased: it appears as a database whose actions
+    # can be restricted (it has no persistent tables of its own).
+    database_names = {
+        name.split(":")[1] for name in checkbox_names if name.startswith("database:")
+    }
+    assert "_memory" in database_names
+
+
+@pytest.mark.asyncio
 async def test_view_table_token_cannot_gain_access_without_base_permission(perms_ds):
     # Only allow a different actor to view this table
     previous_config = perms_ds.config

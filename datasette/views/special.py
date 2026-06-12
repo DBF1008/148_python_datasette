@@ -640,31 +640,22 @@ class CreateTokenView(BaseView):
 
     async def shared(self, request):
         self.check_permission(request)
-        # Build list of databases and tables the user has permission to view
-        db_page = await self.ds.allowed_resources("view-database", request.actor)
-        allowed_databases = [r async for r in db_page.all()]
+        # Shared resource enumeration so the homepage, API explorer and
+        # create-token page all agree on what this actor can see.
+        visible = await self.ds.visible_databases_and_tables(request.actor)
 
-        table_page = await self.ds.allowed_resources("view-table", request.actor)
-        allowed_tables = [r async for r in table_page.all()]
-
-        # Build database -> tables mapping
+        # Build database -> tables mapping. Both tables and views are listed so
+        # token restrictions can target either; no database is special cased.
         database_with_tables = []
-        for db_resource in allowed_databases:
-            database_name = db_resource.parent
-            if database_name == "_memory":
-                continue
-
-            # Find tables for this database
-            tables = []
-            for table_resource in allowed_tables:
-                if table_resource.parent == database_name:
-                    tables.append(
-                        {
-                            "name": table_resource.child,
-                            "encoded": tilde_encode(table_resource.child),
-                        }
-                    )
-
+        for db_info in visible:
+            database_name = db_info["name"]
+            tables = [
+                {
+                    "name": child["name"],
+                    "encoded": tilde_encode(child["name"]),
+                }
+                for child in db_info["tables"] + db_info["views"]
+            ]
             database_with_tables.append(
                 {
                     "name": database_name,
@@ -757,25 +748,18 @@ class ApiExplorerView(BaseView):
     has_json_alternate = False
 
     async def example_links(self, request):
+        # Shared resource enumeration so the homepage, API explorer and
+        # create-token page all agree on what this actor can see.
+        visible = await self.ds.visible_databases_and_tables(request.actor)
         databases = []
-        for name, db in self.ds.databases.items():
-            database_visible, _ = await self.ds.check_visibility(
-                request.actor,
-                action="view-database",
-                resource=DatabaseResource(database=name),
-            )
-            if not database_visible:
-                continue
+        for db_info in visible:
+            name = db_info["name"]
+            db = self.ds.databases[name]
             tables = []
-            table_names = await db.table_names()
-            for table in table_names:
-                visible, _ = await self.ds.check_visibility(
-                    request.actor,
-                    action="view-table",
-                    resource=TableResource(database=name, table=table),
-                )
-                if not visible:
-                    continue
+            # Only real tables get example links here; views are read-only and
+            # are intentionally not surfaced in the API explorer.
+            for table_info in db_info["tables"]:
+                table = table_info["name"]
                 table_links = []
                 tables.append({"name": table, "links": table_links})
                 table_links.append(
