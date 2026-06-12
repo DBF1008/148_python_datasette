@@ -54,6 +54,10 @@ Once it has finished it will output a URL like this one::
 
 Cloud Run provides a URL on the ``.run.app`` domain, but you can also point your own domain or subdomain at your Cloud Run service - see `mapping custom domains <https://cloud.google.com/run/docs/mapping-custom-domains>`__ in the Cloud Run documentation for details.
 
+Rather than deploying directly you can use the ``--generate-dir`` option to output the files that would be deployed to a directory, then inspect them without running ``gcloud`` or deploying anything::
+
+    datasette publish cloudrun mydatabase.db --service=my-service --generate-dir=/tmp/deploy-this-to-cloudrun
+
 See :ref:`cli_help_publish_cloudrun___help` for the full list of options for this command.
 
 .. _publish_heroku:

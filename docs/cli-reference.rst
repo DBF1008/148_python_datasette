@@ -486,6 +486,8 @@ See :ref:`publish_cloud_run`.
       --spatialite                    Enable SpatialLite extension
       --show-files                    Output the generated Dockerfile and
                                       metadata.json
+      --generate-dir DIRECTORY        Output generated application files and stop
+                                      without deploying
       --memory TEXT                   Memory to allocate in Cloud Run, e.g. 1Gi
       --cpu [1|2|4]                   Number of vCPUs to allocate in Cloud Run
       --timeout INTEGER               Build timeout in seconds

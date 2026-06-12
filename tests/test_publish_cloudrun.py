@@ -3,6 +3,7 @@ from datasette import cli
 from unittest import mock
 import json
 import os
+import pathlib
 import pytest
 import textwrap
 
@@ -400,3 +401,107 @@ def test_publish_cloudrun_extra_options(
         .strip()
     )
     assert extra_options == expected
+
+
+@pytest.mark.serial
+@mock.patch("shutil.which")
+@mock.patch("datasette.publish.cloudrun.check_output")
+@mock.patch("datasette.publish.cloudrun.check_call")
+def test_publish_cloudrun_generate_dir(
+    mock_call, mock_output, mock_which, tmp_path_factory
+):
+    # --generate-dir must never touch gcloud, so leave `which` falsy: even with
+    # gcloud entirely absent this must still succeed.
+    mock_which.return_value = False
+    runner = CliRunner()
+    os.chdir(tmp_path_factory.mktemp("runner"))
+    with open("test.db", "w") as fp:
+        fp.write("data")
+    with open("metadata.yml", "w") as fp:
+        fp.write(
+            textwrap.dedent(
+                """
+                title: Hello
+                plugins:
+                  datasette-auth-github:
+                    foo: bar
+                """
+            ).strip()
+        )
+    os.mkdir("mytemplates")
+    with open(os.path.join("mytemplates", "index.html"), "w") as fp:
+        fp.write("custom index")
+    os.mkdir("mystatic")
+    with open(os.path.join("mystatic", "app.css"), "w") as fp:
+        fp.write("body {}")
+    output = str(tmp_path_factory.mktemp("generate_dir") / "output")
+    result = runner.invoke(
+        cli.cli,
+        [
+            "publish",
+            "cloudrun",
+            "test.db",
+            "--metadata",
+            "metadata.yml",
+            "--generate-dir",
+            output,
+            "--plugin-secret",
+            "datasette-auth-github",
+            "client_id",
+            "x-client-id",
+            "--template-dir",
+            "mytemplates",
+            "--static",
+            "assets:mystatic",
+            "--secret",
+            "x-secret",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # No gcloud calls at all: no project lookup, no registry, no prompt, no
+    # build and no deploy.
+    mock_call.assert_not_called()
+    mock_output.assert_not_called()
+    # The full set of generated files is written to disk for inspection.
+    path = pathlib.Path(output)
+    file_names = {str(r.relative_to(path)) for r in path.glob("*")}
+    assert file_names == {
+        "Dockerfile",
+        "metadata.json",
+        "test.db",
+        "templates",
+        "assets",
+    }
+    assert (path / "templates" / "index.html").read_text() == "custom index"
+    assert (path / "assets" / "app.css").read_text() == "body {}"
+    # Plugin secret is materialised into both the Dockerfile and metadata.json.
+    dockerfile = (path / "Dockerfile").read_text()
+    assert "ENV DATASETTE_AUTH_GITHUB_CLIENT_ID 'x-client-id'" in dockerfile
+    metadata = json.loads((path / "metadata.json").read_text())
+    assert metadata["plugins"]["datasette-auth-github"]["client_id"] == {
+        "$env": "DATASETTE_AUTH_GITHUB_CLIENT_ID"
+    }
+    assert metadata["plugins"]["datasette-auth-github"]["foo"] == "bar"
+
+
+@pytest.mark.serial
+@mock.patch("shutil.which")
+@mock.patch("datasette.publish.cloudrun.check_output")
+@mock.patch("datasette.publish.cloudrun.check_call")
+def test_publish_cloudrun_generate_dir_existing(
+    mock_call, mock_output, mock_which, tmp_path_factory
+):
+    mock_which.return_value = False
+    runner = CliRunner()
+    os.chdir(tmp_path_factory.mktemp("runner"))
+    with open("test.db", "w") as fp:
+        fp.write("data")
+    # Directory already exists -> refuse rather than overwrite, and never deploy.
+    output = str(tmp_path_factory.mktemp("generate_dir"))
+    result = runner.invoke(
+        cli.cli,
+        ["publish", "cloudrun", "test.db", "--generate-dir", output],
+    )
+    assert result.exit_code != 0
+    assert "Directory already exists" in result.output
+    mock_call.assert_not_called()
