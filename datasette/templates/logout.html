@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+
+{% block title %}Log out{% endblock %}
+
+{% block content %}
+
+<h1>Log out</h1>
+
+<p>You are logged in as <strong>{{ display_actor(actor) }}</strong></p>
+
+<form class="core" action="{{ urls.logout() }}" method="post">
+    <div>
+        <input type="submit" value="Log out">
+    </div>
+</form>
+
+{% endblock %}

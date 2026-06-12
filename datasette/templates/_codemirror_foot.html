@@ -1,0 +1,42 @@
+<script>
+  {% if table_columns %}
+  const schema = {{ table_columns|tojson(2) }};
+  {% else %}
+  const schema = {};
+  {% endif %}
+
+  window.addEventListener("DOMContentLoaded", () => {
+    const sqlFormat = document.querySelector("button#sql-format");
+    const readOnly = document.querySelector("pre#sql-query");
+    const sqlInput = document.querySelector("textarea#sql-editor");
+    if (sqlFormat && !readOnly) {
+      sqlFormat.hidden = false;
+    }
+    if (sqlInput) {
+      var editor = (window.editor = cm.editorFromTextArea(sqlInput, {
+        schema,
+      }));
+      if (sqlFormat) {
+        sqlFormat.addEventListener("click", (ev) => {
+          const formatted = sqlFormatter.format(editor.state.doc.toString());
+          editor.dispatch({
+            changes: {
+              from: 0,
+              to: editor.state.doc.length,
+              insert: formatted,
+            },
+          });
+        });
+      }
+    }
+    if (sqlFormat && readOnly) {
+      const formatted = sqlFormatter.format(readOnly.innerHTML);
+      if (formatted != readOnly.innerHTML) {
+        sqlFormat.hidden = false;
+        sqlFormat.addEventListener("click", (ev) => {
+          readOnly.innerHTML = formatted;
+        });
+      }
+    }
+  });
+</script>

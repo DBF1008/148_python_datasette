@@ -1,0 +1,229 @@
+{% extends "base.html" %}
+
+{% block title %}Allowed Resources{% endblock %}
+
+{% block extra_head %}
+<script src="{{ base_url }}-/static/json-format-highlight-1.0.1.js"></script>
+{% include "_permission_ui_styles.html" %}
+{% include "_debug_common_functions.html" %}
+{% endblock %}
+
+{% block content %}
+<h1>Allowed resources</h1>
+
+{% set current_tab = "allowed" %}
+{% include "_permissions_debug_tabs.html" %}
+
+<p>Use this tool to check which resources the current actor is allowed to access for a given permission action. It queries the <code>/-/allowed.json</code> API endpoint.</p>
+
+{% if request.actor %}
+<p>Current actor: <strong>{{ request.actor.get("id", "anonymous") }}</strong></p>
+{% else %}
+<p>Current actor: <strong>anonymous (not logged in)</strong></p>
+{% endif %}
+
+<div class="permission-form">
+    <form id="allowed-form" method="get" action="{{ urls.path("-/allowed") }}">
+        <div class="form-section">
+            <label for="action">Action (permission name):</label>
+            <select id="action" name="action" required>
+                <option value="">Select an action...</option>
+                {% for action_name in supported_actions %}
+                <option value="{{ action_name }}">{{ action_name }}</option>
+                {% endfor %}
+            </select>
+            <small>Only certain actions are supported by this endpoint</small>
+        </div>
+
+        <div class="form-section">
+            <label for="parent">Filter by parent (optional):</label>
+            <input type="text" id="parent" name="parent" placeholder="e.g., database name">
+            <small>Filter results to a specific parent resource</small>
+        </div>
+
+        <div class="form-section">
+            <label for="child">Filter by child (optional):</label>
+            <input type="text" id="child" name="child" placeholder="e.g., table name">
+            <small>Filter results to a specific child resource (requires parent to be set)</small>
+        </div>
+
+        <div class="form-section">
+            <label for="page_size">Page size:</label>
+            <input type="number" id="page_size" name="page_size" value="50" min="1" max="200" style="max-width: 100px;">
+            <small>Number of results per page (max 200)</small>
+        </div>
+
+        <div class="form-actions">
+            <button type="submit" class="submit-btn" id="submit-btn">Check Allowed Resources</button>
+        </div>
+    </form>
+</div>
+
+<div id="results-container" style="display: none;">
+    <div class="results-header">
+        <h2>Results</h2>
+        <div class="results-count" id="results-count"></div>
+    </div>
+
+    <div id="results-content"></div>
+
+    <div id="pagination" class="pagination"></div>
+
+    <details style="margin-top: 2em;">
+        <summary style="cursor: pointer; font-weight: bold;">Raw JSON response</summary>
+        <pre id="raw-json" style="margin-top: 1em; padding: 1em; background-color: #f5f5f5; border: 1px solid #ddd; border-radius: 3px; overflow-x: auto;"></pre>
+    </details>
+</div>
+
+<script>
+const form = document.getElementById('allowed-form');
+const resultsContainer = document.getElementById('results-container');
+const resultsContent = document.getElementById('results-content');
+const resultsCount = document.getElementById('results-count');
+const pagination = document.getElementById('pagination');
+const submitBtn = document.getElementById('submit-btn');
+const hasDebugPermission = {{ 'true' if has_debug_permission else 'false' }};
+
+// Populate form on initial load
+(function() {
+    const params = populateFormFromURL();
+    const action = params.get('action');
+    const page = params.get('page');
+    if (action) {
+        fetchResults(page ? parseInt(page) : 1);
+    }
+})();
+
+async function fetchResults(page = 1) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Loading...';
+
+    const formData = new FormData(form);
+    const params = new URLSearchParams();
+
+    for (const [key, value] of formData.entries()) {
+        if (value && key !== 'page_size') {
+            params.append(key, value);
+        }
+    }
+
+    const pageSize = document.getElementById('page_size').value || '50';
+    params.append('page', page.toString());
+    params.append('page_size', pageSize);
+
+    try {
+        const response = await fetch('{{ urls.path("-/allowed.json") }}?' + params.toString(), {
+            method: 'GET',
+            headers: {
+                'Accept': 'application/json',
+            }
+        });
+
+        const data = await response.json();
+
+        if (response.ok) {
+            displayResults(data);
+        } else {
+            displayError(data);
+        }
+    } catch (error) {
+        displayError({ error: error.message });
+    } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Check Allowed Resources';
+    }
+}
+
+function displayResults(data) {
+    resultsContainer.style.display = 'block';
+
+    // Update count
+    resultsCount.textContent = `Showing ${data.items.length} of ${data.total} total resources (page ${data.page})`;
+
+    // Display results table
+    if (data.items.length === 0) {
+        resultsContent.innerHTML = '<div class="no-results">No allowed resources found for this action.</div>';
+    } else {
+        let html = '<table class="results-table">';
+        html += '<thead><tr>';
+        html += '<th>Resource Path</th>';
+        html += '<th>Parent</th>';
+        html += '<th>Child</th>';
+        if (hasDebugPermission) {
+            html += '<th>Reason</th>';
+        }
+        html += '</tr></thead>';
+        html += '<tbody>';
+
+        for (const item of data.items) {
+            html += '<tr>';
+            html += `<td><span class="resource-path">${escapeHtml(item.resource || '/')}</span></td>`;
+            html += `<td>${escapeHtml(item.parent || '—')}</td>`;
+            html += `<td>${escapeHtml(item.child || '—')}</td>`;
+            if (hasDebugPermission) {
+                // Display reason as JSON array
+                let reasonHtml = '—';
+                if (item.reason && Array.isArray(item.reason)) {
+                    reasonHtml = `<code>${escapeHtml(JSON.stringify(item.reason))}</code>`;
+                }
+                html += `<td>${reasonHtml}</td>`;
+            }
+            html += '</tr>';
+        }
+
+        html += '</tbody></table>';
+        resultsContent.innerHTML = html;
+    }
+
+    // Update pagination
+    pagination.innerHTML = '';
+    if (data.previous_url || data.next_url) {
+        if (data.previous_url) {
+            const prevLink = document.createElement('a');
+            prevLink.href = data.previous_url;
+            prevLink.textContent = '← Previous';
+            pagination.appendChild(prevLink);
+        }
+
+        const pageInfo = document.createElement('span');
+        pageInfo.textContent = `Page ${data.page}`;
+        pagination.appendChild(pageInfo);
+
+        if (data.next_url) {
+            const nextLink = document.createElement('a');
+            nextLink.href = data.next_url;
+            nextLink.textContent = 'Next →';
+            pagination.appendChild(nextLink);
+        }
+    }
+
+    // Update raw JSON
+    document.getElementById('raw-json').innerHTML = jsonFormatHighlight(data);
+}
+
+function displayError(data) {
+    resultsContainer.style.display = 'block';
+    resultsCount.textContent = '';
+    pagination.innerHTML = '';
+
+    resultsContent.innerHTML = `<div class="error-message">Error: ${escapeHtml(data.error || 'Unknown error')}</div>`;
+
+    document.getElementById('raw-json').innerHTML = jsonFormatHighlight(data);
+}
+
+// Disable child input if parent is empty
+const parentInput = document.getElementById('parent');
+const childInput = document.getElementById('child');
+
+parentInput.addEventListener('input', () => {
+    childInput.disabled = !parentInput.value;
+    if (!parentInput.value) {
+        childInput.value = '';
+    }
+});
+
+// Initialize disabled state
+childInput.disabled = !parentInput.value;
+</script>
+
+{% endblock %}
