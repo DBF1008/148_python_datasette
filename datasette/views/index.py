@@ -8,6 +8,7 @@ from datasette.utils import (
     CustomJSONEncoder,
 )
 from datasette.utils.asgi import Response
+from datasette.utils.visible_resources import collect_visible_databases_and_tables
 from datasette.version import __version__
 
 from .base import BaseView
@@ -26,31 +27,21 @@ class IndexView(BaseView):
         as_format = request.url_vars["format"]
         await self.ds.ensure_permission(action="view-instance", actor=request.actor)
 
-        # Get all allowed databases and tables in bulk
-        db_page = await self.ds.allowed_resources(
-            "view-database", request.actor, include_is_private=True
+        # Use shared enumeration: includes private flags, includes hidden tables
+        # (hidden tables are still shown on the homepage, just marked as hidden).
+        visible = await collect_visible_databases_and_tables(
+            self.ds,
+            request.actor,
+            include_is_private=True,
+            exclude_memory=False,
+            include_hidden_tables=True,
         )
-        allowed_databases = [r async for r in db_page.all()]
-        allowed_db_dict = {r.parent: r for r in allowed_databases}
-
-        # Group tables by database
-        tables_by_db = {}
-        table_page = await self.ds.allowed_resources(
-            "view-table", request.actor, include_is_private=True
-        )
-        async for t in table_page.all():
-            if t.parent not in tables_by_db:
-                tables_by_db[t.parent] = {}
-            tables_by_db[t.parent][t.child] = t
 
         databases = []
-        # Iterate over allowed databases instead of all databases
-        for name in allowed_db_dict.keys():
+        for name, entry in visible.items():
             db = self.ds.databases[name]
-            database_private = allowed_db_dict[name].private
-
-            # Get allowed tables/views for this database
-            allowed_for_db = tables_by_db.get(name, {})
+            database_private = entry["resource"].private
+            allowed_for_db = entry["tables"]
 
             # Get table names from allowed set instead of db.table_names()
             table_names = [child_name for child_name in allowed_for_db.keys()]

@@ -12,6 +12,7 @@ from datasette.utils import (
     tilde_encode,
     tilde_decode,
 )
+from datasette.utils.visible_resources import collect_visible_databases_and_tables
 from .base import BaseView, View
 import secrets
 import urllib
@@ -640,30 +641,25 @@ class CreateTokenView(BaseView):
 
     async def shared(self, request):
         self.check_permission(request)
-        # Build list of databases and tables the user has permission to view
-        db_page = await self.ds.allowed_resources("view-database", request.actor)
-        allowed_databases = [r async for r in db_page.all()]
-
-        table_page = await self.ds.allowed_resources("view-table", request.actor)
-        allowed_tables = [r async for r in table_page.all()]
+        # Use shared enumeration: excludes _memory, filters hidden tables
+        visible = await collect_visible_databases_and_tables(
+            self.ds,
+            request.actor,
+            include_is_private=False,
+            exclude_memory=True,
+            include_hidden_tables=False,
+        )
 
         # Build database -> tables mapping
         database_with_tables = []
-        for db_resource in allowed_databases:
-            database_name = db_resource.parent
-            if database_name == "_memory":
-                continue
-
-            # Find tables for this database
-            tables = []
-            for table_resource in allowed_tables:
-                if table_resource.parent == database_name:
-                    tables.append(
-                        {
-                            "name": table_resource.child,
-                            "encoded": tilde_encode(table_resource.child),
-                        }
-                    )
+        for database_name, entry in visible.items():
+            tables = [
+                {
+                    "name": table_name,
+                    "encoded": tilde_encode(table_name),
+                }
+                for table_name in entry["tables"]
+            ]
 
             database_with_tables.append(
                 {
@@ -757,25 +753,21 @@ class ApiExplorerView(BaseView):
     has_json_alternate = False
 
     async def example_links(self, request):
+        # Use shared enumeration: filters hidden tables and views, does not exclude _memory
+        visible = await collect_visible_databases_and_tables(
+            self.ds,
+            request.actor,
+            include_is_private=False,
+            exclude_memory=False,
+            include_hidden_tables=False,
+            include_views=False,
+        )
+
         databases = []
-        for name, db in self.ds.databases.items():
-            database_visible, _ = await self.ds.check_visibility(
-                request.actor,
-                action="view-database",
-                resource=DatabaseResource(database=name),
-            )
-            if not database_visible:
-                continue
+        for name, entry in visible.items():
+            db = self.ds.databases[name]
             tables = []
-            table_names = await db.table_names()
-            for table in table_names:
-                visible, _ = await self.ds.check_visibility(
-                    request.actor,
-                    action="view-table",
-                    resource=TableResource(database=name, table=table),
-                )
-                if not visible:
-                    continue
+            for table in entry["tables"]:
                 table_links = []
                 tables.append({"name": table, "links": table_links})
                 table_links.append(
