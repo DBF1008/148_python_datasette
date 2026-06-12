@@ -519,13 +519,21 @@ class DateFacet(Facet):
             config = source_and_config["config"]
             source = source_and_config["source"]
             column = config.get("column") or config["simple"]
-            # TODO: does this query break if inner sql produces value or count columns?
+            # Wrap the aggregation in an outer projection so the ORDER BY only
+            # sees the two output columns (value, count). If the inner sql itself
+            # exposes "value" or "count" columns, referencing those names bare in
+            # the ORDER BY is ambiguous - older SQLite resolves them against the
+            # inner column, breaking the ordering or raising "ambiguous column
+            # name". The inner columns are dropped by the middle projection.
             facet_sql = """
-                select date({col}) as value, count(*) as count from (
-                    {sql}
+                select value, count from (
+                    select date({col}) as value, count(*) as count from (
+                        {sql}
+                    )
+                    where date({col}) is not null
+                    group by date({col})
                 )
-                where date({col}) is not null
-                group by date({col}) order by count desc, value limit {limit}
+                order by count desc, value limit {limit}
             """.format(col=escape_sqlite(column), sql=self.sql, limit=facet_size + 1)
             try:
                 facet_rows_results = await self.ds.execute(

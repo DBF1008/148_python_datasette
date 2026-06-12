@@ -511,6 +511,124 @@ async def test_date_facet_results(ds_client):
 
 
 @pytest.mark.asyncio
+async def test_date_facet_results_with_clashing_value_and_count_columns():
+    # Regression: an inner sql that itself exposes columns literally named
+    # "value" or "count" must not clash with the date facet's own value/count
+    # aliases. Previously the bare value/count identifiers in the ORDER BY were
+    # ambiguous; older SQLite versions resolved them against the inner columns,
+    # which broke the ordering or raised "ambiguous column name".
+    # The inner value/count columns below are deliberately ordered the OPPOSITE
+    # way to the correct (count desc, value asc) result, so sorting by the wrong
+    # column would be observable.
+    ds = Datasette([], memory=True)
+    db = ds.add_database(Database(ds, memory_name="test_date_facet_clash"))
+    await db.execute_write("create table events (dt text, value text, count text)")
+    rows = (
+        ("2019-03-01", "zzz", "111"),
+        ("2019-03-01", "zzz", "111"),
+        ("2019-03-01", "zzz", "111"),
+        ("2019-03-02", "aaa", "999"),
+        ("2019-03-02", "aaa", "999"),
+        ("2019-03-03", "mmm", "555"),
+    )
+    for dt, value, count in rows:
+        await db.execute_write(
+            "insert into events (dt, value, count) values (?, ?, ?)",
+            [dt, value, count],
+        )
+    facet = DateFacet(
+        ds,
+        Request.fake("/?_facet_date=dt"),
+        database="test_date_facet_clash",
+        # inner sql deliberately exposes both a "value" and a "count" column:
+        sql="select dt, value, count from events",
+    )
+    buckets, timed_out = await facet.facet_results()
+    assert timed_out == []
+    assert buckets == [
+        {
+            "name": "dt",
+            "type": "date",
+            "results": [
+                {
+                    "value": "2019-03-01",
+                    "label": "2019-03-01",
+                    "count": 3,
+                    "toggle_url": "http://localhost/?_facet_date=dt&dt__date=2019-03-01",
+                    "selected": False,
+                },
+                {
+                    "value": "2019-03-02",
+                    "label": "2019-03-02",
+                    "count": 2,
+                    "toggle_url": "http://localhost/?_facet_date=dt&dt__date=2019-03-02",
+                    "selected": False,
+                },
+                {
+                    "value": "2019-03-03",
+                    "label": "2019-03-03",
+                    "count": 1,
+                    "toggle_url": "http://localhost/?_facet_date=dt&dt__date=2019-03-03",
+                    "selected": False,
+                },
+            ],
+            "hideable": True,
+            "toggle_url": "/",
+            "truncated": False,
+        }
+    ]
+    # With a date selected, the matching row is selected and toggles back off,
+    # and counts/values are still correct despite the clashing inner columns.
+    facet_selected = DateFacet(
+        ds,
+        Request.fake("/?_facet_date=dt&dt__date=2019-03-01"),
+        database="test_date_facet_clash",
+        sql="select dt, value, count from events",
+    )
+    buckets2, timed_out2 = await facet_selected.facet_results()
+    assert timed_out2 == []
+    by_value = {r["value"]: r for r in buckets2[0]["results"]}
+    assert by_value["2019-03-01"]["selected"] is True
+    assert by_value["2019-03-01"]["count"] == 3
+    assert by_value["2019-03-01"]["toggle_url"] == "http://localhost/?_facet_date=dt"
+    assert by_value["2019-03-02"]["selected"] is False
+
+
+@pytest.mark.asyncio
+async def test_date_facet_truncation_with_clashing_columns():
+    # Truncation of a large result set must still work end-to-end when the inner
+    # query exposes value/count columns (here via select *).
+    ds = Datasette([], memory=True, settings={"default_facet_size": 2})
+    db = ds.add_database(Database(ds, memory_name="test_date_facet_trunc"))
+    await db.execute_write("create table logs (dt text, value text, count text)")
+    rows = (
+        ("2020-01-01", "a", "1"),
+        ("2020-01-01", "a", "1"),
+        ("2020-01-01", "a", "1"),
+        ("2020-01-02", "b", "2"),
+        ("2020-01-02", "b", "2"),
+        ("2020-01-03", "c", "3"),
+        ("2020-01-04", "d", "4"),
+    )
+    for row in rows:
+        await db.execute_write(
+            "insert into logs (dt, value, count) values (?, ?, ?)", list(row)
+        )
+    response = await ds.client.get("/test_date_facet_trunc/logs.json?_facet_date=dt")
+    assert response.status_code == 200
+    facet = response.json()["facet_results"]["results"]["dt"]
+    assert facet["truncated"] is True
+    assert [(r["value"], r["count"]) for r in facet["results"]] == [
+        ("2020-01-01", 3),
+        ("2020-01-02", 2),
+    ]
+    assert facet["results"][0]["toggle_url"] == (
+        "http://localhost/test_date_facet_trunc/logs.json"
+        "?_facet_date=dt&dt__date=2020-01-01"
+    )
+
+
+@pytest.mark.asyncio
 async def test_json_array_with_blanks_and_nulls():
     ds = Datasette([], memory=True)
     db = ds.add_database(Database(ds, memory_name="test_json_array"))
