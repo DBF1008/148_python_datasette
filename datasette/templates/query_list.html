@@ -89,6 +89,11 @@
     color: #4f5b6d;
     font-variant-numeric: tabular-nums;
 }
+.query-list-facet-more {
+    align-self: center;
+    color: #7b8794;
+    font-size: 0.82rem;
+}
 .query-list-results {
     border-collapse: collapse;
     font-size: 0.9rem;
@@ -226,6 +231,7 @@
                     {% for item in facet["items"] %}
                         <li>{% if item.href %}<a class="query-list-facet-link{% if item.active %} query-list-facet-link-active{% endif %}" href="{{ item.href }}"{% if item.active %} aria-current="true"{% endif %}>{% else %}<span class="query-list-facet-link query-list-facet-disabled">{% endif %}<span>{{ item.label }}</span><span class="query-list-facet-count">{{ item.count }}</span>{% if item.href %}</a>{% else %}</span>{% endif %}</li>
                     {% endfor %}
+                    {% if facet.truncated %}<li class="query-list-facet-more" title="More values available — refine your search to narrow them down.">…</li>{% endif %}
                 </ul>
             </section>
         {% endfor %}

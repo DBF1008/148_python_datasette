@@ -356,29 +356,21 @@ async def get_query(datasette: Any, database: str, name: str) -> StoredQuery | N
     return query_row_to_stored_query(rows.first())
 
 
-async def count_queries(
-    datasette: Any,
-    database: str | None = None,
+def _query_filter_where(
+    params: dict[str, Any],
     *,
-    actor: dict[str, Any] | None = None,
     q: str | None = None,
     is_write: bool | None = None,
     is_private: bool | None = None,
     is_trusted: bool | None = None,
     source: str | None = None,
     owner_id: str | None = None,
-) -> int:
-    allowed_sql, allowed_params = await datasette.allowed_resources_sql(
-        action="view-query",
-        actor=actor,
-        parent=database,
-    )
-    params = dict(allowed_params)
+) -> list[str]:
+    # Shared WHERE clauses for listing/counting/faceting stored queries.
+    # Appends bind parameters into ``params`` in place and returns the clause
+    # strings so count_queries, list_queries and query_facet_values stay in
+    # lockstep on filter semantics.
     where_clauses = []
-    if database is not None:
-        params["query_database"] = database
-        where_clauses.append("q.database_name = :query_database")
-
     if q:
         where_clauses.append("""
             (
@@ -404,6 +396,43 @@ async def count_queries(
     if owner_id is not None:
         where_clauses.append("q.owner_id = :query_owner_id")
         params["query_owner_id"] = owner_id
+    return where_clauses
+
+
+async def count_queries(
+    datasette: Any,
+    database: str | None = None,
+    *,
+    actor: dict[str, Any] | None = None,
+    q: str | None = None,
+    is_write: bool | None = None,
+    is_private: bool | None = None,
+    is_trusted: bool | None = None,
+    source: str | None = None,
+    owner_id: str | None = None,
+) -> int:
+    allowed_sql, allowed_params = await datasette.allowed_resources_sql(
+        action="view-query",
+        actor=actor,
+        parent=database,
+    )
+    params = dict(allowed_params)
+    where_clauses = []
+    if database is not None:
+        params["query_database"] = database
+        where_clauses.append("q.database_name = :query_database")
+
+    where_clauses.extend(
+        _query_filter_where(
+            params,
+            q=q,
+            is_write=is_write,
+            is_private=is_private,
+            is_trusted=is_trusted,
+            source=source,
+            owner_id=owner_id,
+        )
+    )
 
     row = (
         await datasette.get_internal_database().execute(
@@ -495,31 +524,17 @@ async def list_queries(
             params["cursor_sort_key"] = components[0]
             params["cursor_name"] = components[1]
 
-    if q:
-        where_clauses.append("""
-            (
-                q.name LIKE :query_search
-                OR q.title LIKE :query_search
-                OR q.description LIKE :query_search
-                OR q.sql LIKE :query_search
-            )
-            """)
-        params["query_search"] = "%{}%".format(q)
-    if is_write is not None:
-        where_clauses.append("q.is_write = :query_is_write")
-        params["query_is_write"] = int(bool(is_write))
-    if is_private is not None:
-        where_clauses.append("q.is_private = :query_is_private")
-        params["query_is_private"] = int(bool(is_private))
-    if is_trusted is not None:
-        where_clauses.append("q.is_trusted = :query_is_trusted")
-        params["query_is_trusted"] = int(bool(is_trusted))
-    if source is not None:
-        where_clauses.append("q.source = :query_source")
-        params["query_source"] = source
-    if owner_id is not None:
-        where_clauses.append("q.owner_id = :query_owner_id")
-        params["query_owner_id"] = owner_id
+    where_clauses.extend(
+        _query_filter_where(
+            params,
+            q=q,
+            is_write=is_write,
+            is_private=is_private,
+            is_trusted=is_trusted,
+            source=source,
+            owner_id=owner_id,
+        )
+    )
 
     private_select = ", allowed.is_private AS private" if include_private else ""
     rows = list(
@@ -579,3 +594,74 @@ async def list_queries(
         has_more=has_more,
         limit=limit,
     )
+
+
+async def query_facet_values(
+    datasette: Any,
+    database: str | None = None,
+    *,
+    field: str,
+    actor: dict[str, Any] | None = None,
+    q: str | None = None,
+    is_write: bool | None = None,
+    is_private: bool | None = None,
+    is_trusted: bool | None = None,
+    source: str | None = None,
+    owner_id: str | None = None,
+    limit: int = 31,
+) -> list[tuple[str, int]]:
+    # Distinct values (with counts) for a facetable query column, honouring the
+    # same visibility JOIN and filters as list_queries/count_queries so counts
+    # never reveal queries the actor cannot view. ``field`` is interpolated into
+    # SQL, so it is restricted to a hard whitelist.
+    if field not in {"source", "owner_id"}:
+        raise ValueError("Unsupported facet field: {!r}".format(field))
+    limit = min(max(1, int(limit)), 1000)
+    allowed_sql, allowed_params = await datasette.allowed_resources_sql(
+        action="view-query",
+        actor=actor,
+        parent=database,
+    )
+    params = dict(allowed_params)
+    params["facet_limit"] = limit
+    where_clauses = []
+    if database is not None:
+        params["query_database"] = database
+        where_clauses.append("q.database_name = :query_database")
+    where_clauses.extend(
+        _query_filter_where(
+            params,
+            q=q,
+            is_write=is_write,
+            is_private=is_private,
+            is_trusted=is_trusted,
+            source=source,
+            owner_id=owner_id,
+        )
+    )
+    where_clauses.append(
+        "(q.{field} IS NOT NULL AND q.{field} != '')".format(field=field)
+    )
+    rows = (
+        await datasette.get_internal_database().execute(
+            """
+            SELECT q.{field} AS value, count(*) AS count
+            FROM queries q
+            JOIN (
+                {allowed_sql}
+            ) allowed
+              ON allowed.parent = q.database_name
+             AND allowed.child = q.name
+            WHERE {where}
+            GROUP BY q.{field}
+            ORDER BY count DESC, value
+            LIMIT :facet_limit
+            """.format(
+                field=field,
+                allowed_sql=allowed_sql,
+                where=" AND ".join(where_clauses),
+            ),
+            params,
+        )
+    ).rows
+    return [(row["value"], row["count"]) for row in rows]

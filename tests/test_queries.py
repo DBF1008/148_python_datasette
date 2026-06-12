@@ -930,6 +930,193 @@ async def test_global_query_list_api_and_html():
 
 
 @pytest.mark.asyncio
+async def test_query_list_source_and_owner_facets_html_and_json():
+    ds = Datasette(memory=True)
+    ds.root_enabled = True
+    ds.add_memory_database("query_list_so_facets", name="data")
+    await ds.invoke_startup()
+    await ds.add_query(
+        "data", "u1", "select 1", title="U1", source="user", owner_id="root"
+    )
+    await ds.add_query(
+        "data", "u2", "select 2", title="U2", source="user", owner_id="alice"
+    )
+    await ds.add_query(
+        "data", "c1", "select 3", title="C1", source="config", owner_id=None
+    )
+
+    html_response = await ds.client.get("/data/-/queries", actor={"id": "root"})
+    json_response = await ds.client.get("/data/-/queries.json", actor={"id": "root"})
+    empty_json = await ds.client.get(
+        "/data/-/queries.json?q=zzzz", actor={"id": "root"}
+    )
+
+    assert html_response.status_code == 200
+    html = html_response.text
+    # Source facet, ordered by descending count
+    assert "<h2>Source</h2>" in html
+    assert (
+        'href="/data/-/queries?source=user"><span>user</span>'
+        '<span class="query-list-facet-count">2</span>'
+    ) in html
+    assert (
+        'href="/data/-/queries?source=config"><span>config</span>'
+        '<span class="query-list-facet-count">1</span>'
+    ) in html
+    # Owner facet — the NULL-owner config query contributes no entry
+    assert "<h2>Owner</h2>" in html
+    assert (
+        'href="/data/-/queries?owner_id=alice"><span>alice</span>'
+        '<span class="query-list-facet-count">1</span>'
+    ) in html
+    assert (
+        'href="/data/-/queries?owner_id=root"><span>root</span>'
+        '<span class="query-list-facet-count">1</span>'
+    ) in html
+
+    # JSON exposes the same discoverable facets
+    facets = {facet["title"]: facet for facet in json_response.json()["facets"]}
+    assert facets["Source"]["items"] == [
+        {
+            "label": "user",
+            "count": 2,
+            "href": "/data/-/queries?source=user",
+            "active": False,
+        },
+        {
+            "label": "config",
+            "count": 1,
+            "href": "/data/-/queries?source=config",
+            "active": False,
+        },
+    ]
+    assert facets["Source"]["truncated"] is False
+    # NULL owner excluded; equal counts fall back to value ordering (alice, root)
+    assert [(item["label"], item["count"]) for item in facets["Owner"]["items"]] == [
+        ("alice", 1),
+        ("root", 1),
+    ]
+
+    # No-results keeps the always-on Mode/Visibility facets but omits the
+    # value-driven Source/Owner facets (nothing to discover).
+    empty_titles = [facet["title"] for facet in empty_json.json()["facets"]]
+    assert "Mode" in empty_titles and "Visibility" in empty_titles
+    assert "Source" not in empty_titles and "Owner" not in empty_titles
+
+
+@pytest.mark.asyncio
+async def test_query_list_facet_selection_composition_and_pagination():
+    ds = Datasette(memory=True)
+    ds.root_enabled = True
+    ds.add_memory_database("query_list_facet_combo", name="data")
+    await ds.invoke_startup()
+    await add_numbered_queries(ds, "data", 2)  # source=user, owner=root
+    await ds.add_query(
+        "data", "cfg", "select 9", title="Cfg", source="config", owner_id="root"
+    )
+
+    selected = await ds.client.get("/data/-/queries?source=user", actor={"id": "root"})
+    combined = await ds.client.get("/data/-/queries?is_write=0", actor={"id": "root"})
+
+    sel = selected.text
+    # The chosen value becomes active with a removal link back to the bare list
+    assert (
+        '<a class="query-list-facet-link query-list-facet-link-active"'
+        ' href="/data/-/queries" aria-current="true"><span>user</span>'
+        '<span class="query-list-facet-count">2</span></a>'
+    ) in sel
+    # Sibling values collapse once one is chosen (matches the boolean facets)
+    assert "<span>config</span>" not in sel
+    # Changing a facet never carries the pagination cursor forward
+    assert "_next" not in sel
+
+    # Source facet links compose onto an already-applied facet, order preserved
+    com = combined.text
+    assert 'href="/data/-/queries?is_write=0&amp;source=user"' in com
+    assert 'href="/data/-/queries?is_write=0&amp;source=config"' in com
+
+
+@pytest.mark.asyncio
+async def test_query_list_facets_respect_private_visibility():
+    ds = Datasette(memory=True)
+    ds.root_enabled = True
+    ds.add_memory_database("query_list_facet_private", name="data")
+    await ds.invoke_startup()
+    # Public query visible to everyone
+    await ds.add_query(
+        "data", "pub", "select 1", title="Pub", source="user", owner_id="alice"
+    )
+    # Private query owned by alice, carrying a source value no other query has
+    await ds.add_query(
+        "data",
+        "sec",
+        "select 2",
+        title="Sec",
+        is_private=True,
+        source="secret",
+        owner_id="alice",
+    )
+
+    def facet_map(payload):
+        return {
+            facet["title"]: {item["label"]: item["count"] for item in facet["items"]}
+            for facet in payload.get("facets", [])
+            if facet["title"] in ("Source", "Owner")
+        }
+
+    alice = facet_map(
+        (await ds.client.get("/data/-/queries.json", actor={"id": "alice"})).json()
+    )
+    root = facet_map(
+        (await ds.client.get("/data/-/queries.json", actor={"id": "root"})).json()
+    )
+    anon = facet_map((await ds.client.get("/data/-/queries.json")).json())
+
+    # Only the owning actor sees the private query's source value — the facet
+    # count must not reveal a query other actors cannot view.
+    assert alice["Source"].get("secret") == 1
+    assert "secret" not in root.get("Source", {})
+    assert "secret" not in anon.get("Source", {})
+    # Owner counts reflect only each actor's visible set
+    assert alice["Owner"]["alice"] == 2  # pub + sec
+    assert root["Owner"]["alice"] == 1  # pub only (sec is private to alice)
+    assert anon["Owner"]["alice"] == 1  # pub only
+
+
+@pytest.mark.asyncio
+async def test_query_list_facet_owner_with_special_characters():
+    ds = Datasette(memory=True)
+    ds.root_enabled = True
+    ds.add_memory_database("query_list_facet_special", name="data")
+    await ds.invoke_startup()
+    await ds.add_query(
+        "data", "sp", "select 1", title="SP", source="user", owner_id="a b@c"
+    )
+
+    response = await ds.client.get("/data/-/queries", actor={"id": "root"})
+    assert 'href="/data/-/queries?owner_id=a+b%40c"><span>a b@c</span>' in response.text
+
+    # Following the URL-encoded href keeps the facet active (clean round-trip)
+    followed = await ds.client.get(
+        "/data/-/queries?owner_id=a+b%40c", actor={"id": "root"}
+    )
+    assert "query-list-facet-link-active" in followed.text
+    assert "<span>a b@c</span>" in followed.text
+
+
+@pytest.mark.asyncio
+async def test_query_facet_values_rejects_unknown_field():
+    ds = Datasette(memory=True)
+    ds.add_memory_database("query_facet_guard", name="data")
+    await ds.invoke_startup()
+    # field is interpolated into SQL, so anything outside the whitelist is rejected
+    with pytest.raises(ValueError):
+        await ds.query_facet_values("data", field="owner_id; DROP TABLE queries")
+    with pytest.raises(ValueError):
+        await ds.query_facet_values("data", field="is_write")
+
+
+@pytest.mark.asyncio
 async def test_query_store_api_rejects_is_trusted():
     ds = Datasette(
         memory=True,

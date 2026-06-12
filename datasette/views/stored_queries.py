@@ -22,6 +22,8 @@ from .query_helpers import (
     _query_list_limit,
 )
 
+QUERY_FACET_SIZE = 30
+
 
 class QueryParametersView(BaseView):
     name = "query-parameters"
@@ -169,6 +171,47 @@ class QueryListView(BaseView):
                 if item is not None
             ]
 
+        async def string_facet(title, field):
+            values = await self.ds.query_facet_values(
+                database,
+                field=field,
+                actor=request.actor,
+                q=current_filters["q"],
+                is_write=current_filters["is_write"],
+                is_private=current_filters["is_private"],
+                source=current_filters["source"],
+                owner_id=current_filters["owner_id"],
+                limit=QUERY_FACET_SIZE + 1,
+            )
+            truncated = len(values) > QUERY_FACET_SIZE
+            values = values[:QUERY_FACET_SIZE]
+            items = []
+            for value, count in values:
+                active = current_filters[field] == value
+                if active:
+                    href = _query_list_url(
+                        query_list_path,
+                        request.query_string,
+                        remove_args=[field],
+                    )
+                else:
+                    href = _query_list_url(
+                        query_list_path,
+                        request.query_string,
+                        set_args={field: value},
+                    )
+                items.append(
+                    {
+                        "label": value,
+                        "count": count,
+                        "href": href,
+                        "active": active,
+                    }
+                )
+            if not items:
+                return None
+            return {"title": title, "items": items, "truncated": truncated}
+
         facets = [
             {
                 "title": "Mode",
@@ -189,6 +232,12 @@ class QueryListView(BaseView):
                 ),
             },
         ]
+        for string_facet_def in [
+            await string_facet("Source", "source"),
+            await string_facet("Owner", "owner_id"),
+        ]:
+            if string_facet_def is not None:
+                facets.append(string_facet_def)
 
         data = {
             "ok": True,

@@ -1195,6 +1195,34 @@ class Datasette:
             include_private=include_private,
         )
 
+    async def query_facet_values(
+        self,
+        database: str | None = None,
+        *,
+        field: str,
+        actor: dict[str, Any] | None = None,
+        q: str | None = None,
+        is_write: bool | None = None,
+        is_private: bool | None = None,
+        is_trusted: bool | None = None,
+        source: str | None = None,
+        owner_id: str | None = None,
+        limit: int = 31,
+    ) -> list[tuple[str, int]]:
+        return await stored_queries.query_facet_values(
+            self,
+            database,
+            field=field,
+            actor=actor,
+            q=q,
+            is_write=is_write,
+            is_private=is_private,
+            is_trusted=is_trusted,
+            source=source,
+            owner_id=owner_id,
+            limit=limit,
+        )
+
     async def ensure_query_write_permissions(
         self, database, sql, *, actor=None, params=None, analysis=None
     ):
