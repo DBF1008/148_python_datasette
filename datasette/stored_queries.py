@@ -402,8 +402,11 @@ async def count_queries(
         where_clauses.append("q.source = :query_source")
         params["query_source"] = source
     if owner_id is not None:
-        where_clauses.append("q.owner_id = :query_owner_id")
-        params["query_owner_id"] = owner_id
+        if owner_id == "":
+            where_clauses.append("q.owner_id IS NULL")
+        else:
+            where_clauses.append("q.owner_id = :query_owner_id")
+            params["query_owner_id"] = owner_id
 
     row = (
         await datasette.get_internal_database().execute(
@@ -424,6 +427,90 @@ async def count_queries(
         )
     ).first()
     return row["count"]
+
+
+async def distinct_query_filter_values(
+    datasette: Any,
+    field: str,
+    database: str | None = None,
+    *,
+    actor: dict[str, Any] | None = None,
+    q: str | None = None,
+    is_write: bool | None = None,
+    is_private: bool | None = None,
+    source: str | None = None,
+    owner_id: str | None = None,
+) -> list[tuple[str | None, int]]:
+    """Return distinct values with counts for a query list field.
+
+    Applies all filters *except* ``field`` (cross-filtering) so the
+    counts are comparable across values of the same facet.  Respects
+    view-query permissions via ``allowed_resources_sql``.
+    """
+    if field not in ("source", "owner_id"):
+        raise ValueError("Invalid facet field: {}".format(field))
+
+    allowed_sql, allowed_params = await datasette.allowed_resources_sql(
+        action="view-query",
+        actor=actor,
+        parent=database,
+    )
+    params = dict(allowed_params)
+    where_clauses: list[str] = []
+    if database is not None:
+        params["query_database"] = database
+        where_clauses.append("q.database_name = :query_database")
+
+    if q:
+        where_clauses.append(
+            """
+            (
+                q.name LIKE :query_search
+                OR q.title LIKE :query_search
+                OR q.description LIKE :query_search
+                OR q.sql LIKE :query_search
+            )
+            """
+        )
+        params["query_search"] = "%{}%".format(q)
+    if field != "is_write" and is_write is not None:
+        where_clauses.append("q.is_write = :query_is_write")
+        params["query_is_write"] = int(bool(is_write))
+    if field != "is_private" and is_private is not None:
+        where_clauses.append("q.is_private = :query_is_private")
+        params["query_is_private"] = int(bool(is_private))
+    if field != "source" and source is not None:
+        where_clauses.append("q.source = :query_source")
+        params["query_source"] = source
+    if field != "owner_id" and owner_id is not None:
+        if owner_id == "":
+            where_clauses.append("q.owner_id IS NULL")
+        else:
+            where_clauses.append("q.owner_id = :query_owner_id")
+            params["query_owner_id"] = owner_id
+
+    rows = (
+        await datasette.get_internal_database().execute(
+            """
+            SELECT q.{field} AS value, count(*) AS count
+            FROM queries q
+            JOIN (
+                {allowed_sql}
+            ) allowed
+              ON allowed.parent = q.database_name
+             AND allowed.child = q.name
+            WHERE {where}
+            GROUP BY q.{field}
+            ORDER BY count DESC, q.{field} ASC
+            """.format(
+                field=field,
+                allowed_sql=allowed_sql,
+                where=" AND ".join(where_clauses) or "1 = 1",
+            ),
+            params,
+        )
+    ).rows
+    return [(row["value"], row["count"]) for row in rows]
 
 
 async def list_queries(
@@ -518,8 +605,11 @@ async def list_queries(
         where_clauses.append("q.source = :query_source")
         params["query_source"] = source
     if owner_id is not None:
-        where_clauses.append("q.owner_id = :query_owner_id")
-        params["query_owner_id"] = owner_id
+        if owner_id == "":
+            where_clauses.append("q.owner_id IS NULL")
+        else:
+            where_clauses.append("q.owner_id = :query_owner_id")
+            params["query_owner_id"] = owner_id
 
     private_select = ", allowed.is_private AS private" if include_private else ""
     rows = list(

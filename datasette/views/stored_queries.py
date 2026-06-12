@@ -61,7 +61,7 @@ def _query_list_url(path, query_string, *, set_args=None, remove_args=None):
         if key not in skip
     ]
     for key, value in set_args.items():
-        if value not in (None, ""):
+        if value is not None:
             pairs.append((key, value))
     return path + (("?" + urlencode(pairs)) if pairs else "")
 
@@ -97,7 +97,7 @@ class QueryListView(BaseView):
             is_write=is_write,
             is_private=is_private,
             source=request.args.get("source") or None,
-            owner_id=request.args.get("owner_id") or None,
+            owner_id=request.args.get("owner_id"),
             include_private=True,
         )
         query_list_path = self.query_list_path(database)
@@ -122,7 +122,7 @@ class QueryListView(BaseView):
             "is_write": is_write,
             "is_private": is_private,
             "source": request.args.get("source") or None,
-            "owner_id": request.args.get("owner_id") or None,
+            "owner_id": request.args.get("owner_id"),
         }
 
         async def facet_count(field, value):
@@ -132,22 +132,28 @@ class QueryListView(BaseView):
             filters[field] = value
             return await self.ds.count_queries(database, **filters)
 
-        def facet_href(field, value):
-            if current_filters[field] == value:
+        def _is_active(field, str_value):
+            current = current_filters[field]
+            if current is None:
+                return False
+            if isinstance(current, bool):
+                return str(int(current)) == str_value
+            return str(current) == str_value
+
+        def facet_href(field, str_value):
+            if _is_active(field, str_value):
                 return _query_list_url(
                     query_list_path,
                     request.query_string,
                     remove_args=[field],
                 )
-            if current_filters[field] is not None:
-                return None
             return _query_list_url(
                 query_list_path,
                 request.query_string,
-                set_args={field: str(int(value))},
+                set_args={field: str_value},
             )
 
-        async def facet_item(label, field, value):
+        async def facet_item(label, field, value, str_value):
             count = await facet_count(field, value)
             active = current_filters[field] == value
             if not active and not count:
@@ -155,7 +161,7 @@ class QueryListView(BaseView):
             return {
                 "label": label,
                 "count": count,
-                "href": facet_href(field, value) if active or count else None,
+                "href": facet_href(field, str_value) if active or count else None,
                 "active": active,
             }
 
@@ -163,8 +169,8 @@ class QueryListView(BaseView):
             return [
                 item
                 for item in [
-                    await facet_item(label, field, value)
-                    for label, field, value in items
+                    await facet_item(label, field, value, str_value)
+                    for label, field, value, str_value in items
                 ]
                 if item is not None
             ]
@@ -174,8 +180,8 @@ class QueryListView(BaseView):
                 "title": "Mode",
                 "items": await facet_items(
                     [
-                        ("Read-only", "is_write", False),
-                        ("Writable", "is_write", True),
+                        ("Read-only", "is_write", False, "0"),
+                        ("Writable", "is_write", True, "1"),
                     ]
                 ),
             },
@@ -183,12 +189,60 @@ class QueryListView(BaseView):
                 "title": "Visibility",
                 "items": await facet_items(
                     [
-                        ("Not private", "is_private", False),
-                        ("Private", "is_private", True),
+                        ("Not private", "is_private", False, "0"),
+                        ("Private", "is_private", True, "1"),
                     ]
                 ),
             },
         ]
+
+        # Source and Owner facets — dynamic multi-value facets
+        cross_filters = {
+            "actor": request.actor,
+            "q": current_filters["q"],
+            "is_write": is_write,
+            "is_private": is_private,
+        }
+
+        for facet_field, facet_title in [
+            ("source", "Source"),
+            ("owner_id", "Owner"),
+        ]:
+            raw_param = request.args.get(facet_field)
+            has_filter = raw_param is not None
+            active_str = raw_param if has_filter else None
+            value_pairs = await self.ds.distinct_query_filter_values(
+                facet_field,
+                database,
+                source=current_filters["source"],
+                owner_id=current_filters["owner_id"],
+                **cross_filters,
+            )
+            value_map = dict(value_pairs)
+            if has_filter and active_str not in {
+                v if v is not None else "" for v in value_map
+            }:
+                value_map[active_str or None] = 0
+            if len(value_map) > 1 or has_filter:
+                items = []
+                for val, count in sorted(
+                    value_map.items(), key=lambda x: (-x[1], str(x[0]))
+                ):
+                    item_str = val if val is not None else ""
+                    active = has_filter and item_str == active_str
+                    if not active and not count:
+                        continue
+                    label = val if val is not None else "(no owner)"
+                    items.append(
+                        {
+                            "label": label,
+                            "count": count,
+                            "href": facet_href(facet_field, item_str),
+                            "active": active,
+                        }
+                    )
+                if items:
+                    facets.append({"title": facet_title, "items": items})
 
         data = {
             "ok": True,

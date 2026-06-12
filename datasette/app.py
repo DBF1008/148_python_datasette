@@ -1195,6 +1195,30 @@ class Datasette:
             include_private=include_private,
         )
 
+    async def distinct_query_filter_values(
+        self,
+        field: str,
+        database: str | None = None,
+        *,
+        actor: dict[str, Any] | None = None,
+        q: str | None = None,
+        is_write: bool | None = None,
+        is_private: bool | None = None,
+        source: str | None = None,
+        owner_id: str | None = None,
+    ):
+        return await stored_queries.distinct_query_filter_values(
+            self,
+            field,
+            database,
+            actor=actor,
+            q=q,
+            is_write=is_write,
+            is_private=is_private,
+            source=source,
+            owner_id=owner_id,
+        )
+
     async def ensure_query_write_permissions(
         self, database, sql, *, actor=None, params=None, analysis=None
     ):

@@ -846,6 +846,164 @@ async def test_query_list_search_filter_and_html():
 
 
 @pytest.mark.asyncio
+async def test_query_list_source_and_owner_facets():
+    ds = Datasette(memory=True)
+    ds.root_enabled = True
+    ds.add_memory_database("query_list_facets", name="data")
+    await ds.invoke_startup()
+
+    # 3 queries from source=user, owner=root
+    await add_numbered_queries(ds, "data", 3)
+    # 2 queries from source=config, no owner
+    await ds.add_query(
+        "data", "config_q1", "select 'c1'", title="Config query 1",
+        source="config",
+    )
+    await ds.add_query(
+        "data", "config_q2", "select 'c2'", title="Config query 2",
+        source="config",
+    )
+    # 1 query from source=plugin, owner=alice
+    await ds.add_query(
+        "data", "plugin_q1", "select 'p1'", title="Plugin query 1",
+        source="plugin", owner_id="alice",
+    )
+
+    # --- HTML: facets appear with correct counts ---
+    html = await ds.client.get("/data/-/queries", actor={"id": "root"})
+    assert html.status_code == 200
+    assert "<h2>Source</h2>" in html.text
+    assert "<h2>Owner</h2>" in html.text
+    # Source facet: user=3, config=2, plugin=1
+    assert (
+        'href="/data/-/queries?source=user"><span>user</span>'
+        '<span class="query-list-facet-count">3</span>'
+        in html.text
+    )
+    assert (
+        'href="/data/-/queries?source=config"><span>config</span>'
+        '<span class="query-list-facet-count">2</span>'
+        in html.text
+    )
+    assert (
+        'href="/data/-/queries?source=plugin"><span>plugin</span>'
+        '<span class="query-list-facet-count">1</span>'
+        in html.text
+    )
+    # Owner facet: root=3, (no owner)=2, alice=1
+    assert (
+        'href="/data/-/queries?owner_id=root"><span>root</span>'
+        '<span class="query-list-facet-count">3</span>'
+        in html.text
+    )
+    assert (
+        'href="/data/-/queries?owner_id="><span>(no owner)</span>'
+        '<span class="query-list-facet-count">2</span>'
+        in html.text
+    )
+    assert (
+        'href="/data/-/queries?owner_id=alice"><span>alice</span>'
+        '<span class="query-list-facet-count">1</span>'
+        in html.text
+    )
+
+    # --- JSON: facets present in response ---
+    json_resp = await ds.client.get("/data/-/queries.json", actor={"id": "root"})
+    assert json_resp.status_code == 200
+    facet_titles = [f["title"] for f in json_resp.json()["facets"]]
+    assert "Source" in facet_titles
+    assert "Owner" in facet_titles
+    source_facet = next(f for f in json_resp.json()["facets"] if f["title"] == "Source")
+    source_labels = {item["label"]: item["count"] for item in source_facet["items"]}
+    assert source_labels == {"user": 3, "config": 2, "plugin": 1}
+
+    # --- Filter by source=config (JSON) ---
+    filtered = await ds.client.get(
+        "/data/-/queries.json?source=config", actor={"id": "root"}
+    )
+    assert [q["name"] for q in filtered.json()["queries"]] == [
+        "config_q1", "config_q2",
+    ]
+
+    # --- Filter by source=config (HTML): active facet + cross-filtered counts ---
+    filtered_html = await ds.client.get(
+        "/data/-/queries?source=config", actor={"id": "root"}
+    )
+    assert "Config query 1" in filtered_html.text
+    assert "Demo query 01" not in filtered_html.text
+    # Source "config" is active
+    assert (
+        'query-list-facet-link-active" href="/data/-/queries"'
+        in filtered_html.text
+    )
+    # Other source values show cross-filtered counts (under source=config only)
+    assert (
+        'href="/data/-/queries?source=config&amp;source=user"' not in filtered_html.text
+    )
+    # user count when source=config is active shows what user queries total (without source filter)
+    assert (
+        'href="/data/-/queries?source=user"><span>user</span>'
+        '<span class="query-list-facet-count">3</span>'
+        in filtered_html.text
+    )
+
+    # --- Filter by owner_id=alice (JSON) ---
+    owner_filtered = await ds.client.get(
+        "/data/-/queries.json?owner_id=alice", actor={"id": "root"}
+    )
+    assert [q["name"] for q in owner_filtered.json()["queries"]] == ["plugin_q1"]
+
+    # --- Cross-filtering: source=user + owner_id=root ---
+    cross = await ds.client.get(
+        "/data/-/queries?source=user&owner_id=root", actor={"id": "root"}
+    )
+    assert cross.status_code == 200
+    # All 3 numbered queries match
+    assert "Demo query 01" in cross.text
+    assert "Demo query 02" in cross.text
+    assert "Demo query 03" in cross.text
+    assert "Config query 1" not in cross.text
+    assert "Plugin query 1" not in cross.text
+
+    # --- Single-value facet hidden when no active filter ---
+    ds2 = Datasette(memory=True)
+    ds2.root_enabled = True
+    ds2.add_memory_database("query_list_single", name="data")
+    await ds2.invoke_startup()
+    # All queries have same source and same owner
+    await add_numbered_queries(ds2, "data", 3)
+    single_html = await ds2.client.get("/data/-/queries", actor={"id": "root"})
+    # Source facet should NOT appear (only one value: user)
+    assert "<h2>Source</h2>" not in single_html.text
+    # Owner facet should NOT appear (only one value: root)
+    assert "<h2>Owner</h2>" not in single_html.text
+
+    # --- Private query visibility in facet counts ---
+    ds3 = Datasette(memory=True)
+    ds3.root_enabled = True
+    ds3.add_memory_database("query_list_priv", name="data")
+    await ds3.invoke_startup()
+    await ds3.add_query(
+        "data", "pub_user", "select 1", title="Public user query",
+        source="user", owner_id="root",
+    )
+    await ds3.add_query(
+        "data", "priv_config", "select 2", title="Private config query",
+        source="config", is_private=True, owner_id="root",
+    )
+    # As root (owner), can see both — Source facet shows both values
+    root_html = await ds3.client.get("/data/-/queries", actor={"id": "root"})
+    assert "<h2>Source</h2>" in root_html.text
+    assert "user" in root_html.text
+    assert "config" in root_html.text
+
+    # As anonymous/other user, cannot see the private query
+    anon_html = await ds3.client.get("/data/-/queries")
+    # Only 1 visible query (pub_user, source=user), so Source facet is hidden
+    assert "<h2>Source</h2>" not in anon_html.text
+
+
+@pytest.mark.asyncio
 async def test_query_list_html_defaults_to_twenty_and_shows_pagination():
     ds = Datasette(memory=True)
     ds.root_enabled = True
