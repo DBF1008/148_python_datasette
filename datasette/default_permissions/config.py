@@ -76,6 +76,9 @@ class ConfigPermissionProcessor:
         # Pre-compute restriction info for efficiency
         self.restricted_databases: Set[str] = set()
         self.restricted_tables: Set[Tuple[str, str]] = set()
+        # Track (parent, child) resources that have explicit config rules,
+        # so gate denies don't override legitimate table-level config
+        self._config_rule_resources: Set[Tuple[Optional[str], Optional[str]]] = set()
 
         if self.has_restrictions:
             self.restricted_databases = {
@@ -163,6 +166,10 @@ class ConfigPermissionProcessor:
             if_not_none=True,
         )
 
+        # Track that this resource has an explicit config rule
+        if result is not None:
+            self._config_rule_resources.add((parent, child))
+
     def add_allow_block_rule(
         self,
         parent: Optional[str],
@@ -193,6 +200,9 @@ class ConfigPermissionProcessor:
             f"config {'allow' if result else 'deny'} {scope_desc}",
         )
 
+        # Track that this resource has an explicit config rule
+        self._config_rule_resources.add((parent, child))
+
         # Handle restriction-gate: add explicit denies for restricted resources
         self._add_restriction_gate_denies(parent, child, bool_result, scope_desc)
 
@@ -204,20 +214,29 @@ class ConfigPermissionProcessor:
         scope_desc: str,
     ) -> None:
         """
-        When a config rule denies at a higher level, add explicit denies
-        for restricted resources to prevent child-level allows from
-        incorrectly granting access.
+        Add explicit child-level deny rules to enforce restriction boundaries.
+
+        For DENY case (parent-level config denies): add child-level denies for
+        restricted tables that don't have their own explicit config rules.
+        This prevents child-level allows from incorrectly granting access.
+
+        For ALLOW case (parent-level config allows): add child-level denies for
+        restricted tables NOT in the restriction allowlist and WITHOUT explicit
+        config rules. This provides defense-in-depth alongside restriction_sql.
         """
-        if is_allowed or child is not None or not self.has_restrictions:
+        if child is not None or not self.has_restrictions:
             return
 
         if not self.action_obj:
             return
 
         reason = f"config deny {scope_desc} (restriction gate)"
+        is_root = parent is None
 
-        if parent is None:
-            # Root-level deny: add denies for all restricted resources
+        if is_root:
+            # Root-level rule: processed before table-level rules, so we
+            # cannot check _config_rule_resources for table-level entries.
+            # Add gate denies for all restricted resources.
             if self.action_obj.takes_parent:
                 for db_name in self.restricted_databases:
                     self.collector.add(db_name, None, False, reason)
@@ -225,11 +244,28 @@ class ConfigPermissionProcessor:
                 for db_name, table_name in self.restricted_tables:
                     self.collector.add(db_name, table_name, False, reason)
         else:
-            # Database-level deny: add denies for tables in that database
-            if self.action_obj.takes_child:
-                for db_name, table_name in self.restricted_tables:
-                    if db_name == parent:
+            # Database-level rule: table-level rules already processed,
+            # so we can check _config_rule_resources to avoid overriding
+            # legitimate table-level config rules.
+            if not self.action_obj.takes_child:
+                return
+
+            for db_name, table_name in self.restricted_tables:
+                if db_name != parent:
+                    continue
+
+                # Skip tables with explicit config rules - their own rules
+                # should decide their fate (specificity system handles this)
+                if (db_name, table_name) in self._config_rule_resources:
+                    continue
+
+                if is_allowed:
+                    # ALLOW case: only deny tables NOT in restriction allowlist
+                    if not self.is_in_restriction_allowlist(db_name, table_name):
                         self.collector.add(db_name, table_name, False, reason)
+                else:
+                    # DENY case: deny all restricted tables without config rules
+                    self.collector.add(db_name, table_name, False, reason)
 
     def process(self) -> Optional[PermissionSQL]:
         """Process all config rules and return combined PermissionSQL."""
